@@ -22,6 +22,7 @@
 // navigation change. That branch also sets the leftover TAG preset flags FE+0x4C9/+0x4CA,
 // which our Enter normalises back to a plain QUICK GAME setup.
 #include "lan_ui.h"
+#include "arabic.h"
 #include "lan_match.h"
 #include "net_lan.h"
 #include "net_sync.h"
@@ -176,6 +177,34 @@ static void TxtAppend(uint16_t slot, const char* fmt, ...) {
 #define BTN_A "\x08X"
 #define BTN_B "\x08O"
 #define BTN_D "\x08D"                 // the d-pad glyph, as used by retail's own hint band
+
+// --- localization ------------------------------------------------------------
+// These screens are the port's own, and unlike a retail menu label most of their text is
+// rebuilt EVERY FRAME out of live session state ("YOUR NAME: <name>", "SKIN 2/4"), so it
+// cannot be a whole pack string. Only the FIXED part is translated; the composition stays
+// here, written in READING order, and the runtime shaper places the digits and the Latin
+// runs (a typed player name, an IP address) where right-to-left text wants them.
+//
+// The English literal stays at the call site ON PURPOSE: it is the fallback, and it is what
+// makes this file still readable by someone who does not read Arabic.
+enum {                                 // pack indices; the text lives in tools/arabic_lan.py
+    TXT_TITLE = 0x200, TXT_YOURNAME, TXT_PASSWORD, TXT_NONE, TXT_HOSTGAME, TXT_JOINIP,
+    TXT_GAMESON, TXT_DIFFVER, TXT_INMATCH, TXT_FULL, TXT_LOCKED, TXT_OPEN, TXT_QUICK,
+    TXT_TOURNEY, TXT_NOGAMES,
+    TXT_LOBBY = 0x210, TXT_HOSTING, TXT_JOINED, TXT_YOU, TXT_PLAYER, TXT_COMPUTER,
+    TXT_SKIN, TXT_SEATOPEN, TXT_REMOVE, TXT_TEAM, TXT_ARENA, TXT_FIGHTSET, TXT_MODE,
+    TXT_STARTMATCH, TXT_QUICKMATCH, TXT_TOURNAMENT, TXT_MEATRUSH, TXT_DPADMOVE,
+    TXT_CHANGE, TXT_LEAVE, TXT_BEGIN, TXT_READYWAIT, TXT_WHENREADY, TXT_READY,
+    TXT_KDELETE = 0x228, TXT_KSPACE, TXT_KDONE,
+    TXT_ENTERNAME = 0x230, TXT_SETPW, TXT_ENTERIP, TXT_GAMELOCKED,
+    TXT_BACK = 0x250, TXT_SELECT, TXT_CANCEL, TXT_SEARCHING, TXT_HOSTINGON,
+    TXT_JOINING, TXT_STARTING, TXT_CONNECTING,
+};
+static const char* L(uint16_t id, const char* en) {
+    if (ArabicEnabled())
+        if (const char* a = ArabicText(id)) return a;
+    return en;
+}
 
 // --- measuring text ----------------------------------------------------------
 // THE FONT IS PROPORTIONAL AND THE LAYOUT IS COLUMNS, so "12 characters" is not a width:
@@ -473,10 +502,11 @@ static bool ModalUpdate() {
 }
 static const char* ModalTitle() {
     switch (g_modal) {
-    case MODAL_NAME:     return "ENTER YOUR NAME";
-    case MODAL_PASSWORD: return "SET A PASSWORD - LEAVE IT EMPTY FOR AN OPEN GAME";
-    case MODAL_IP:       return "ENTER THE HOST'S ADDRESS";
-    case MODAL_JOINPW:   return "THIS GAME IS LOCKED";
+    case MODAL_NAME:     return L(TXT_ENTERNAME, "ENTER YOUR NAME");
+    case MODAL_PASSWORD: return L(TXT_SETPW,
+                             "SET A PASSWORD - LEAVE IT EMPTY FOR AN OPEN GAME");
+    case MODAL_IP:       return L(TXT_ENTERIP, "ENTER THE HOST'S ADDRESS");
+    case MODAL_JOINPW:   return L(TXT_GAMELOCKED, "THIS GAME IS LOCKED");
     default:             return "";
     }
 }
@@ -523,12 +553,16 @@ static const float kColName = 0.26f, kColPlay = 0.50f, kColMode = 0.59f, kColSta
 static const float kWName = 0.40f, kWPlay = 0.07f, kWMode = 0.11f, kWState = 0.26f;
 static const float kWLine = 0.90f;          // anything centred on 0.5 and spanning the row
 static const float kBrowRow = 0.043f, kBrowHdr = 0.030f, kBrowSmall = 0.032f;
-static Row g_b_title, g_b_name, g_b_pass, g_b_host, g_b_ip, g_b_hdr,
+static Row g_b_title, g_b_name, g_b_pass, g_b_nameV, g_b_passV,
+           g_b_host, g_b_ip, g_b_hdr,
            g_b_rowName[kBrowseRows], g_b_rowPlay[kBrowseRows], g_b_rowMode[kBrowseRows],
            g_b_rowTag[kBrowseRows],
            g_b_empty, g_b_status, g_b_foot;
 static Row g_m_title, g_m_text, g_m_foot, g_m_cell[42];
 static uint32_t g_bIt_name, g_bIt_pass, g_bIt_host, g_bIt_ip, g_bIt_row[kBrowseRows];
+// The VALUE halves of the name and password rows. Non-selectable: the label row is
+// still the one the cursor lands on and the one that opens the editor.
+static uint32_t g_bIt_nameV, g_bIt_passV;
 
 // The modal's rows are appended to whichever screen builds them; both screens build their
 // own copies of the same static Row storage, which is safe because only one screen is ever
@@ -601,8 +635,16 @@ static void ModalDetach(uint32_t self) {
 static void RefreshModalText() {
     Txt(T_MTITLE, "%s", ModalTitle());
     Txt(T_MTEXT, "%s_", g_modalBuf);
-    Txt(T_MFOOT, BTN_A " SELECT    " BTN_B " CANCEL    (OR JUST TYPE)");
-    for (int i = 0; i < kCellN; ++i) Txt(T_GRID0 + i, "%s", kCellText[i]);
+    Txt(T_MFOOT, BTN_A " %s    " BTN_B " %s", L(TXT_SELECT, "SELECT"), L(TXT_CANCEL, "CANCEL"));
+    // The three action keys are labels, not characters: translate them. Everything above
+    // them is a Latin character the player is actually typing and must stay as it is.
+    for (int i = 0; i < kCellN; ++i) {
+        const char* cell = kCellText[i];
+        if (i == kCellDel)      cell = L(TXT_KDELETE, "DELETE");
+        else if (i == kCellOk)  cell = L(TXT_KDONE,   "DONE");
+        else if (i == kCellOk - 1) cell = L(TXT_KSPACE, "SPACE");
+        Txt(T_GRID0 + i, "%s", cell);
+    }
     // The title is a whole sentence and the entry field can hold a 40-character hostname:
     // both were drawn at a fixed scale and simply ran off the sides, over the grid
     // (user-reported "the keyboard overlaps"). They shrink now instead.
@@ -617,9 +659,16 @@ static void __fastcall Hk_BrowseBuild(uint32_t self, uint32_t) {
     AppendItem(self, 0, MakeRow(g_b_title, kTextBase + T_TITLE5, 0.5f, 0.07f, false, 0.055f));
     g_bIt_name = MakeRow(g_b_name, kTextBase + T_NAME_L, 0.5f, 0.19f, true, kRow);
     g_bIt_pass = MakeRow(g_b_pass, kTextBase + T_PASS_L, 0.5f, 0.26f, true, kRow);
+    // Same rows, same y: the value is a separate ITEM so that in Arabic it is a line of
+    // its own with no Arabic on it, and therefore draws through the retail font.
+    g_bIt_nameV = MakeRow(g_b_nameV, kTextBase + T_NAME_V, 0.5f, 0.19f, false, kRow,
+                          ALIGN_RIGHT);
+    g_bIt_passV = MakeRow(g_b_passV, kTextBase + T_PASS_V, 0.5f, 0.26f, false, kRow,
+                          ALIGN_RIGHT);
     g_bIt_host = MakeRow(g_b_host, kTextBase + T_HOST,   0.5f, 0.34f, true, kRow);
     g_bIt_ip   = MakeRow(g_b_ip,   kTextBase + T_JOINIP, 0.5f, 0.41f, true, kRow);
     AppendItem(self, 0, g_bIt_name); AppendItem(self, 0, g_bIt_pass);
+    AppendItem(self, 0, g_bIt_nameV); AppendItem(self, 0, g_bIt_passV);
     AppendItem(self, 0, g_bIt_host); AppendItem(self, 0, g_bIt_ip);
 
     // One centred section title, no column headers: "PLAYERS MODE PING" ran into each other
@@ -651,25 +700,49 @@ static void __fastcall Hk_BrowseBuild(uint32_t self, uint32_t) {
 #endif
 
 static void RefreshBrowserText() {
-    Txt(T_TITLE5, "LAN GAME");
-    Txt(T_NAME_L, "YOUR NAME:  %s", LanGetName());
-    Txt(T_PASS_L, "PASSWORD:  %s", g_hostPassword[0] ? g_hostPassword : "NONE");
-    Txt(T_HOST, "HOST A GAME");
-    Txt(T_JOINIP, "JOIN BY ADDRESS");
+    Txt(T_TITLE5, "%s", L(TXT_TITLE, "LAN GAME"));
+    // ENGLISH keeps the single composed row it has always had. ARABIC splits label from
+    // value, because a Latin name on an Arabic line is drawn by the Arabic font and that
+    // font has no Latin letters -- the name simply did not appear (user-reported).
+    // Two columns about the centre: the label sits to the RIGHT of it and the value to
+    // the LEFT, which is the order an Arabic reader wants them in.
+    const bool arSplit = ArabicEnabled();
+    if (arSplit) {
+        Txt(T_NAME_L, "%s", L(TXT_YOURNAME, "YOUR NAME:"));
+        Txt(T_NAME_V, "%s", LanGetName());
+    } else {
+        Txt(T_NAME_L, "%s  %s", L(TXT_YOURNAME, "YOUR NAME:"), LanGetName());
+        Txt(T_NAME_V, " ");
+    }
+    // The password VALUE is Latin only when the player typed one; "NONE" is a pack string
+    // and Arabic, so it stays on the label line where it reads naturally.
+    if (arSplit) {
+        // ALWAYS split, even when the value is the Arabic "NONE": splitting only
+        // sometimes left this row centred while the name row above it was anchored to a
+        // column, so the two labels sat at completely different x and looked broken.
+        Txt(T_PASS_L, "%s", L(TXT_PASSWORD, "PASSWORD:"));
+        Txt(T_PASS_V, "%s", g_hostPassword[0] ? g_hostPassword : L(TXT_NONE, "NONE"));
+    } else {
+        Txt(T_PASS_L, "%s  %s", L(TXT_PASSWORD, "PASSWORD:"),
+            g_hostPassword[0] ? g_hostPassword : L(TXT_NONE, "NONE"));
+        Txt(T_PASS_V, " ");
+    }
+    Txt(T_HOST, "%s", L(TXT_HOSTGAME, "HOST A GAME"));
+    Txt(T_JOINIP, "%s", L(TXT_JOINIP, "JOIN BY ADDRESS"));
     int n = LanGameCount();
-    Txt(T_HDR_NAME, "GAMES ON THIS NETWORK");
+    Txt(T_HDR_NAME, "%s", L(TXT_GAMESON, "GAMES ON THIS NETWORK"));
     for (int i = 0; i < kBrowseRows; ++i) {
         const LanGameInfo* g = LanGameAt(i);
         bool live = g != nullptr;
         if (live) {
-            const char* tag = !g->compatible ? "DIFFERENT VERSION"
-                            : g->inMatch     ? "IN A MATCH"
-                            : g->players >= g->maxPlayers ? "FULL"
-                            : g->locked      ? "LOCKED"
-                                             : "OPEN";
+            const char* tag = !g->compatible ? L(TXT_DIFFVER, "DIFFERENT VERSION")
+                            : g->inMatch     ? L(TXT_INMATCH, "IN A MATCH")
+                            : g->players >= g->maxPlayers ? L(TXT_FULL, "FULL")
+                            : g->locked      ? L(TXT_LOCKED, "LOCKED")
+                                             : L(TXT_OPEN, "OPEN");
             Txt(T_ROWNAME0 + i, "%s", g->host);
             Txt(T_ROWPLAY0 + i, "%u/%u", g->players, g->maxPlayers);
-            Txt(T_ROWMODE0 + i, "%s", g->mode ? "TOURNEY" : "QUICK");
+            Txt(T_ROWMODE0 + i, "%s", g->mode ? L(TXT_TOURNEY, "TOURNEY") : L(TXT_QUICK, "QUICK"));
             Txt(T_ROWTAG0 + i, "%s", tag);
         }
         bool joinable = live && g->compatible && !g->inMatch && g->players < g->maxPlayers;
@@ -678,14 +751,58 @@ static void RefreshBrowserText() {
         RowShow((uint32_t)(uintptr_t)g_b_rowMode[i].mem, live, false);
         RowShow((uint32_t)(uintptr_t)g_b_rowTag[i].mem, live, false);
     }
-    Txt(T_EMPTY, "NO GAMES YET - IS THE OTHER " TJ_HOST_WORD_UC " ON THIS NETWORK?");
+    Txt(T_EMPTY, "%s", L(TXT_NOGAMES,
+         "NO GAMES YET - IS THE OTHER " TJ_HOST_WORD_UC " ON THIS NETWORK?"));
     RowShow((uint32_t)(uintptr_t)g_b_empty.mem, n == 0, false);
     Txt(T_STATUS5, "%s", LanStatusLine());
-    Txt(T_FOOT5, BTN_B " BACK    " BTN_A " SELECT");
+    Txt(T_FOOT5, BTN_B " %s    " BTN_A " %s", L(TXT_BACK, "BACK"), L(TXT_SELECT, "SELECT"));
 
     const float kRow = kBrowRow, kHdr = kBrowHdr, kSmall = kBrowSmall;
-    Fit(g_b_name, T_NAME_L, kRow, kWLine, 0.026f);
-    Fit(g_b_pass, T_PASS_L, kRow, kWLine, 0.026f);
+    // Split: label anchored just right of centre and running right, value ending just
+    // left of centre. Unsplit: the label is centred exactly as before and the value row
+    // is empty and hidden, so English is byte-for-byte the layout it always had.
+    // TWO RIGHT-ALIGNED COLUMNS. Arabic reads from the right, so the edge the eye runs down
+    // is the label's RIGHT edge -- left-aligning them lined up the edge nobody reads and left
+    // the right edges 59px apart, which is what still looked broken. Both columns are anchored
+    // by their right edge instead, and the value column is placed from the MEASURED width of
+    // the widest label (the game's own measurer is hooked, so this is the real shaped Arabic
+    // width) rather than from a guessed constant that a longer label would silently overrun.
+    if (arSplit) {
+        // Column widths from the WIDEST entry in each column, so the two rows share one pair
+        // of edges; then the whole block is centred on 0.5 -- the axis HOST A GAME and JOIN BY
+        // ADDRESS sit on -- so all four rows of this list line up as one group.
+        const float kGutter = 0.035f;
+        float wl = TextWidth(g_txt[T_NAME_L], kRow);
+        float wp = TextWidth(g_txt[T_PASS_L], kRow);
+        float labW = wl > wp ? wl : wp;
+        float vn = TextWidth(g_txt[T_NAME_V], kRow);
+        float vp = TextWidth(g_txt[T_PASS_V], kRow);
+        float valW = vn > vp ? vn : vp;
+        float total = labW + kGutter + valW;
+        if (total > kWLine) total = kWLine;                // never wider than the row
+        float kLabRight = 0.5f + total * 0.5f;             // the block, centred on 0.5
+        float valRight  = kLabRight - labW - kGutter;
+        if (valRight < 0.06f) valRight = 0.06f;            // never off the left of the screen
+        SetAlign(g_bIt_name,  0, ALIGN_RIGHT);
+        SetAlign(g_bIt_pass,  0, ALIGN_RIGHT);
+        *(float*)(uintptr_t)(g_bIt_name  + 0x40) = kLabRight;
+        *(float*)(uintptr_t)(g_bIt_pass  + 0x40) = kLabRight;
+        *(float*)(uintptr_t)(g_bIt_nameV + 0x40) = valRight;
+        *(float*)(uintptr_t)(g_bIt_passV + 0x40) = valRight;
+        Fit(g_b_name,  T_NAME_L, kRow, 0.34f, 0.026f);
+        Fit(g_b_pass,  T_PASS_L, kRow, 0.34f, 0.026f);
+        Fit(g_b_nameV, T_NAME_V, kRow, valRight - 0.06f, 0.026f);
+        Fit(g_b_passV, T_PASS_V, kRow, valRight - 0.06f, 0.026f);
+    } else {
+        SetAlign(g_bIt_name, 0, ALIGN_CENTRE);
+        SetAlign(g_bIt_pass, 0, ALIGN_CENTRE);
+        *(float*)(uintptr_t)(g_bIt_name + 0x40) = 0.5f;
+        *(float*)(uintptr_t)(g_bIt_pass + 0x40) = 0.5f;
+        Fit(g_b_name, T_NAME_L, kRow, kWLine, 0.026f);
+        Fit(g_b_pass, T_PASS_L, kRow, kWLine, 0.026f);
+    }
+    RowShow(g_bIt_nameV, arSplit, false);
+    RowShow(g_bIt_passV, arSplit, false);
     Fit(g_b_hdr,  T_HDR_NAME, kHdr, kWLine, 0.022f);
     for (int i = 0; i < kBrowseRows; ++i) {
         Fit(g_b_rowName[i], T_ROWNAME0 + i, kSmall, kWName,  0.022f);
@@ -1271,10 +1388,10 @@ static bool CellEnabled(int row, int col) {
 static void RefreshLobbyText(uint32_t self) {
     const bool host = LanIsHost();
     const int  me   = LanLocalSlot();
-    Txt(T_TITLE15, "LAN LOBBY");
+    Txt(T_TITLE15, "%s", L(TXT_LOBBY, "LAN LOBBY"));
     int players = 0;
     for (int i = 0; i < 4; ++i) { const LanSlotInfo* s = LanSlot(i); if (s && s->kind) ++players; }
-    Txt(T_LSTATEL, "%s", host ? "HOSTING" : "JOINED");
+    Txt(T_LSTATEL, "%s", host ? L(TXT_HOSTING, "HOSTING") : L(TXT_JOINED, "JOINED"));
     if (LanPingMs()) Txt(T_LSTATER, "%d/4 - %uMS", players, LanPingMs());
     else             Txt(T_LSTATER, "%d/4", players);
 
@@ -1283,8 +1400,10 @@ static void RefreshLobbyText(uint32_t self) {
         const LanSlotInfo* s = LanSlot(i);
         const bool used = s && s->kind;
         const bool mine = (i == me) || (host && s && s->kind == 2);
-        Txt(T_SLOTHEAD0 + i, i == me ? "YOU - P%d" : "PLAYER %d", i + 1);
-        Txt(T_SLOTNAME0 + i, "%s", !used ? " " : (s->kind == 2 ? "COMPUTER" : s->name));
+        Txt(T_SLOTHEAD0 + i, "%s %d", i == me ? L(TXT_YOU, "YOU - P")
+                                            : L(TXT_PLAYER, "PLAYER"), i + 1);
+        Txt(T_SLOTNAME0 + i, "%s", !used ? " "
+            : (s->kind == 2 ? L(TXT_COMPUTER, "COMPUTER") : s->name));
         // EVERY CELL STAYS VISIBLE, even on an empty seat. Hiding a cell the cursor can still
         // land on means the selection flare draws on an invisible row -- the cursor simply
         // disappears when you move into an open seat. Empty cells show "-" and are disabled.
@@ -1292,19 +1411,24 @@ static void RefreshLobbyText(uint32_t self) {
         // "n/m" only where m is knowable -- this PC's own unlock state. A remote player's
         // save is not ours to report, so their seat just names the skin they picked.
         if (!used)                       Txt(T_SLOTSKIN0 + i, "-");
-        else if (!mine)                  Txt(T_SLOTSKIN0 + i, "SKIN %d", s->costume + 1);
-        else if (LanCostumeUnlocked(s->charId) <= 1) Txt(T_SLOTSKIN0 + i, "SKIN 1");
-        else Txt(T_SLOTSKIN0 + i, "SKIN %d/%d", s->costume + 1, LanCostumeUnlocked(s->charId));
+        else if (!mine)                  Txt(T_SLOTSKIN0 + i, "%s %d",
+                                         L(TXT_SKIN, "SKIN"), s->costume + 1);
+        else if (LanCostumeUnlocked(s->charId) <= 1) Txt(T_SLOTSKIN0 + i, "%s 1",
+                                                     L(TXT_SKIN, "SKIN"));
+        else Txt(T_SLOTSKIN0 + i, "%s %d/%d", L(TXT_SKIN, "SKIN"),
+                 s->costume + 1, LanCostumeUnlocked(s->charId));
         // One meaning per slot, always. The old lobby put "ADD CPU" in the READY slot, so the
         // same line meant a state on a filled seat and an instruction on an empty one.
-        Txt(T_SLOTTYPE0 + i, "%s", !used ? "OPEN" : (s->kind == 2 ? "CPU" : "HUMAN"));
+        Txt(T_SLOTTYPE0 + i, "%s", !used ? L(TXT_SEATOPEN, "OPEN")
+            : (s->kind == 2 ? L(TXT_COMPUTER, "CPU") : L(TXT_PLAYER, "HUMAN")));
         // Say what the button will actually do, and only while the host is standing on it: a
         // cell that reads "HUMAN" gives no hint that A throws that player out of the game.
         if (host && used && s->kind == 1 && !SeatIsMine(i) &&
             g_curRow == 2 && g_curCol == i)
-            Txt(T_SLOTTYPE0 + i, "REMOVE?");
-        if (used) Txt(T_SLOTTEAM0 + i, "TEAM %c%s", 'A' + (s->team & 3),
-                      (s->kind == 1 && s->ready) ? "  READY" : "");
+            Txt(T_SLOTTYPE0 + i, "%s", L(TXT_REMOVE, "REMOVE?"));
+        const bool rdy = (s && s->kind == 1 && s->ready);
+        if (used) Txt(T_SLOTTEAM0 + i, "%s%s%s", LanTeamName(s->team),
+                      rdy ? "  " : "", rdy ? L(TXT_READY, "READY") : "");
         else      Txt(T_SLOTTEAM0 + i, "-");
         // The extra local players' cursors. They have no selection flare of their own -- there
         // is only one on this screen and it is player 1's -- so each marks the cell it sits on
@@ -1352,20 +1476,23 @@ static void RefreshLobbyText(uint32_t self) {
         Fit(g_l_slotTeam[i], T_SLOTTEAM0 + i, kScCell, kSeatW, 0.025f);
     }
 
-    Txt(T_ARENA, "ARENA:  %s", LanArenaName(LanConfigArena()));
-    Txt(T_SET,   "FIGHT SETTINGS");
-    static const char* const kModeName[3] = { "QUICK MATCH", "TOURNAMENT", "MEAT RUSH" };
-    Txt(T_MODE,  "MODE:  %s", kModeName[LanConfigMode() < 3 ? LanConfigMode() : 0]);
-    Txt(T_START, "START MATCH");
-    Txt(T_HINT0 + 0, "D-PAD MOVE");
-    Txt(T_HINT0 + 1, BTN_A " CHANGE");
-    Txt(T_HINT0 + 2, BTN_B " LEAVE");
+    Txt(T_ARENA, "%s  %s", L(TXT_ARENA, "ARENA:"), LanArenaName(LanConfigArena()));
+    Txt(T_SET,   "%s", L(TXT_FIGHTSET, "FIGHT SETTINGS"));
+    const char* const kModeName[3] = { L(TXT_QUICKMATCH, "QUICK MATCH"),
+                                       L(TXT_TOURNAMENT, "TOURNAMENT"),
+                                       L(TXT_MEATRUSH,   "MEAT RUSH") };
+    Txt(T_MODE,  "%s  %s", L(TXT_MODE, "MODE:"),
+        kModeName[LanConfigMode() < 3 ? LanConfigMode() : 0]);
+    Txt(T_START, "%s", L(TXT_STARTMATCH, "START MATCH"));
+    Txt(T_HINT0 + 0, "%s", L(TXT_DPADMOVE, "D-PAD MOVE"));
+    Txt(T_HINT0 + 1, BTN_A " %s", L(TXT_CHANGE, "CHANGE"));
+    Txt(T_HINT0 + 2, BTN_B " %s", L(TXT_LEAVE, "LEAVE"));
     // One prompt, in retail's own slot, saying the single most useful thing: for the host why
     // it cannot start yet, for everyone else what START does.
     const char* why = host ? LanStartRefusal() : nullptr;
-    if (host)                Txt(T_PROMPT, "%s", why ? why : "PRESS START TO BEGIN");
-    else if (LanSlot(me) && LanSlot(me)->ready) Txt(T_PROMPT, "READY - WAITING FOR THE HOST");
-    else                     Txt(T_PROMPT, "PRESS START WHEN YOU ARE READY");
+    if (host)                Txt(T_PROMPT, "%s", why ? why : L(TXT_BEGIN, "PRESS START TO BEGIN"));
+    else if (LanSlot(me) && LanSlot(me)->ready) Txt(T_PROMPT, "%s", L(TXT_READYWAIT, "READY - WAITING FOR THE HOST"));
+    else                     Txt(T_PROMPT, "%s", L(TXT_WHENREADY, "PRESS START WHEN YOU ARE READY"));
 
     Fit(g_l_arena,  T_ARENA,  kScRow, kSharedW, 0.030f);
     Fit(g_l_set,    T_SET,    kScRow, kSharedW, 0.030f);
@@ -1566,7 +1693,23 @@ void LanMenuBuild(uint32_t self) {
     *(uint32_t*)(uintptr_t)(tour + 0x60) = lan;
     if (after) *(uint32_t*)(uintptr_t)(after + 0x64) = lan;
     else *(uint32_t*)(uintptr_t)(self + 0x18) = lan;
-    Txt(T_TITLE5, "LAN GAME");
+    LanMenuRefreshText();
+}
+
+// The LAN row's label is a SNAPSHOT of the language, and Build is NOT a per-entry hook: the
+// frontend factory runs every screen's vtable+0x08 once, when the frontend object is built,
+// while a screen-to-screen change runs only Update (+0x10) and Enter (+0x14). So toggling
+// LANGUAGE on OPTIONS and walking back to the main menu left the previous language's bytes
+// sitting here -- and the two halves the user reported are the same defect seen from each
+// side. English -> Arabic simply stayed English. Arabic -> English made the row VANISH:
+// the retail font's codepage map at font+0x800 is memset to 0xFF and filled only for the
+// 124 retail characters, so every byte of the stale Arabic string is unmapped, and an
+// unmapped byte draws nothing and advances the pen -- a present, still-selectable, entirely
+// invisible row. Entering the browser repaired it because RefreshBrowserText writes the
+// SAME slot. Every other main-menu row is a live per-draw table lookup, which is why this
+// one row was alone in being wrong.
+void LanMenuRefreshText() {
+    Txt(T_TITLE5, "%s", L(TXT_TITLE, "LAN GAME"));
 }
 
 // The main menu is also a launch-capable screen: it is where the headless harness sits, and
@@ -1683,7 +1826,7 @@ int InstallLanUi() {
     n += PatchJump(0x29690, HOOK_FC(Hk_LobbyUpdate),  "lan:lobby.update")  ? 1 : 0;
     n += PatchJump(0x291A0, HOOK_FC(Hk_LobbyEnter),   "lan:lobby.enter")   ? 1 : 0;
     for (int i = 0; i < kTextN; ++i) g_txt[i][0] = 0;
-    Txt(T_TITLE5, "LAN GAME");
+    Txt(T_TITLE5, "%s", L(TXT_TITLE, "LAN GAME"));
     printf("[lan] UI installed (%d/6 screen hooks)\n", n);
     LanContractDump();          // TJ_LAN_HASHDUMP=1 only: log the contract at startup
     return n;

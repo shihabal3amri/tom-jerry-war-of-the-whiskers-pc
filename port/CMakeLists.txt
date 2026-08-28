@@ -123,6 +123,7 @@ add_library(tj_hybrid SHARED
     src/hybrid/dsound_bridge.cpp
     src/hybrid/fe_menu.cpp
     src/hybrid/audio_ui.cpp
+    src/hybrid/arabic.cpp
     src/hybrid/xcrypt.cpp
     src/hybrid/net_sync.cpp
     src/hybrid/net_lan.cpp
@@ -195,6 +196,22 @@ else()
     set(TJ_APK_RC "// no Android template at configure time (run build_apk.ps1 -Template)")
     set(TJ_HAVE_APK 0)
     message(STATUS "installer: NO Android template — the installer will be PC-only")
+endif()
+
+# THE ARABIC PACK: glyph art + the translated string table, built by
+#     port/tools/arabic_font.py --pack port/build-arabic/arabic_font.bin
+# which needs Python + Pillow + a system Arabic face -- on THIS machine, not on any player's.
+# It is NOT in the repo: it carries 64 signature bytes lifted from the game's own font sheet,
+# and the rule is that nothing derived from the disc is ever pushed. Same footing as the
+# Android template: read at CONFIGURE time, and absent means the installer ships no Arabic
+# and the game stays English (arabic.cpp treats a missing pack as "feature unavailable").
+set(TJ_ARABIC_PACK "${CMAKE_CURRENT_SOURCE_DIR}/build-arabic/arabic_font.bin")
+if(EXISTS "${TJ_ARABIC_PACK}")
+    set(TJ_ARABIC_RC "IDR_ARABIC_FONT        RCDATA  \"${TJ_ARABIC_PACK}\"")
+    message(STATUS "installer: Arabic pack found, Arabic will be installed")
+else()
+    set(TJ_ARABIC_RC "// no Arabic pack at configure time (run tools/arabic_font.py --pack)")
+    message(STATUS "installer: NO Arabic pack -- the installed game will be English-only")
 endif()
 
 # Same VC++ redist the dist folder ships. Windows does not include it; app-local copies are

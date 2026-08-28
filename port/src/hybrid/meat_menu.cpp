@@ -137,6 +137,16 @@ static void __fastcall Hk_MultiEnter(uint32_t self, uint32_t edx) {
     Select(self, 0);
 }
 
+
+// The rows this port added are driven by our OWN input tests, so they have to make their own
+// sound -- retail plays its click from inside the code that owns its rows. Same object and
+// same ids the LAN screens use: 5 = cursor move, 0x13 = accept, 1 = back.
+static void UiSfx(uint32_t id) {
+    uint32_t m = *(volatile uint32_t*)(uintptr_t)kMasterPtr;
+    uint32_t snd = m ? *U32(m + 0x1C904) : 0;
+    if (snd) GCALL(Fastcall, FnThisU32, 0x705E0, snd, 0, id);
+}
+
 static uint32_t __fastcall Hk_MultiUpdate(uint32_t self, uint32_t edx) {
     (void)edx;
     uint32_t m = Master(), fe = FeMgr();
@@ -146,16 +156,17 @@ static uint32_t __fastcall Hk_MultiUpdate(uint32_t self, uint32_t edx) {
     if (!in) return 14;
 
     for (uint32_t pad = 0; pad < 4; ++pad) {
-        if (InputTest(in, 0, 6, pad)) { Select(self, g_sel + 1); break; }
-        if (InputTest(in, 0, 5, pad)) { Select(self, g_sel - 1); break; }
+        if (InputTest(in, 0, 6, pad)) { Select(self, g_sel + 1); UiSfx(5); break; }
+        if (InputTest(in, 0, 5, pad)) { Select(self, g_sel - 1); UiSfx(5); break; }
     }
     for (uint32_t pad = 0; pad < 4; ++pad) {
-        if (InputTest(in, 0, 2, pad)) { return 4; }        // B -> main menu
+        if (InputTest(in, 0, 2, pad)) { UiSfx(1); return 4; }   // B -> main menu
         if (!InputTest(in, 0, 1, pad)) continue;                   // A
         // What the retail main-menu tails did before handing over to screen 11 (0x215A0 /
         // 0x215C1 / the shared 0x215D3): tournament flag, arena reset, and the QUICK GAME
         // family id. Screen 11's own fresh setup then runs, because the manager's prev-screen
         // test at 0x1D48E now names this screen.
+        UiSfx(0x13);
         bool tourn = (g_sel == 1);
         *U8(fe + 0x508) = tourn ? 1 : 0;
         if (tourn && m) *U8(m + 0x1C90D) = 1;

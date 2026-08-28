@@ -172,6 +172,17 @@ if ($Install) {
             }
         }
     }
+    # THE ARABIC PACK rides with the game data, not in the apk: on Android the executable is
+    # libtjgame.so in the app's read-only native-lib dir, so arabic.cpp looks in the ASSET ROOT
+    # instead. Pushed to the root of extracted/, which is LAN-safe -- dataHash covers
+    # default.xbe plus GFX/AUDMUSIC/AUDSoundFX, so a peer without the pack still matches.
+    $pack = "$root\portuild-arabicrabic_font.bin"
+    if (Test-Path $pack) {
+        & $adbExe push $pack "$extDir/extracted/arabic_font.bin"
+        Write-Host "== pushed arabic_font.bin ($([math]::Round((Get-Item $pack).Length/1KB)) KB) =="
+    } else {
+        Write-Host "== no arabic_font.bin (run tools/arabic_font.py --pack) -- APK stays English =="
+    }
     Write-Host "launching..."
     & $adbExe shell am start -n com.wotw.port/android.app.NativeActivity
 }

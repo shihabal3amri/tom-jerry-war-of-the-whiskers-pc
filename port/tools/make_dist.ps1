@@ -45,6 +45,15 @@ if ($saveKeep) { Move-Item $saveKeep "$Out\_SAVES" }
 
 # 1. the port itself
 Copy-Item "$bin\tj_loader.exe","$bin\tj_hybrid.dll" $Out
+# 1b. the Arabic pack, when this machine has built one (tools/arabic_font.py --pack).
+#     Optional by design: with no pack the game simply stays English.
+$arabic = Join-Path $PSScriptRoot "..\build-arabic\arabic_font.bin"
+if (Test-Path $arabic) {
+  Copy-Item $arabic $Out
+  Write-Host "   + arabic_font.bin ($([math]::Round((Get-Item $arabic).Length/1KB)) KB)"
+} else {
+  Write-Host "   (no Arabic pack -- the dist folder will be English-only)"
+}
 
 # 2. runtime DLLs Windows does NOT ship. The UCRT (api-ms-win-crt-*), d3d11, dxgi, ws2_32,
 #    xinput1_4 and xaudio2_9 are all inbox on Windows 10/11; the VC++ runtime is not, and

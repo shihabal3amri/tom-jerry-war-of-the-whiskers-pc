@@ -17,6 +17,10 @@
 // the installer is built on a machine with no Android SDK (see TJ_HAVE_APK). The SIGNING KEY
 // is deliberately not here: it is generated per player at first use (apk_build.cpp).
 #define IDR_APK_TEMPLATE       111
+// The Arabic pack (glyph art + translated strings). OPTIONAL, exactly like the Android
+// template: produced by port/tools/arabic_font.py, and when it is absent at configure time
+// the installer simply ships no Arabic and the game stays English.
+#define IDR_ARABIC_FONT        112
 
 #define IDD_MAIN               200
 #define IDC_ISO_PATH           201

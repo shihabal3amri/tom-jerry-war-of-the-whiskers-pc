@@ -67,6 +67,11 @@ static const uint32_t kInputMgr   = 0x4BC;     // MASTER+ -> frontend input mana
 static const uint32_t kTimeLimit  = 0x16A264;
 static const uint32_t kSetting    = 0x16A26B;  // our blob byte
 static const uint32_t kRowMarkers = 0x2B0;     // screen+ : the row above us (y 0.58)
+// Retail's six rows, 0x84 apart, in screen order: TIME ROUNDS DIFFICULTY VIBRATION MARKERS
+// then CONFIRM. Verified by arithmetic against the two offsets this file already knew
+// (MARKERS 0x2B0 and CONFIRM 0x334 differ by exactly one item).
+static const uint32_t kRetailRows[5] = { 0xA0, 0x124, 0x1A8, 0x22C, 0x2B0 };
+static const float    kRetailY[5]    = { 0.30f, 0.37f, 0.44f, 0.51f, 0.58f };
 static const uint32_t kRowConfirm = 0x334;     // screen+ : the row below us (y 0.72)
 
 // ---- strings -----------------------------------------------------------------
@@ -118,6 +123,16 @@ static inline uint32_t* U32(uint32_t va) { return (uint32_t*)(uintptr_t)va; }
 
 static bool TimeLimited() { return *U32(kTimeLimit) != 0xFFFFFFFFu; }
 
+// The rows this port added are driven by our OWN input tests, so they have to make their own
+// sound -- retail plays its click from inside the code that owns its rows. Same object and
+// same ids the LAN screens use: 5 = cursor move, 0x13 = accept, 1 = back.
+static void UiSfx(uint32_t id) {
+    uint32_t m = *(volatile uint32_t*)(uintptr_t)kMasterPtr;
+    uint32_t snd = m ? *U32(m + 0x1C904) : 0;
+    if (snd) GCALL(Fastcall, FnThisU32, 0x705E0, snd, 0, id);
+}
+
+
 static int IndexOfSetting() {
     uint8_t v = *U8(kSetting);
     for (int i = 0; i < V_COUNT; ++i) if (kValTarget[i] == v) return i;
@@ -159,13 +174,18 @@ static void BuildRow(uint32_t self) {
     SetAlign(it, 0, 1);                                     // centre, like every other row
     SetScale(it, 0, 0x3D23D70A);                            // 0.04f -- the screen's row scale
     *(float*)(uintptr_t)(it + 0x40) = 0.5f;
-    // TWO rows now share the gap between MARKERS (0.58) and CONFIRM (0.72), at 0.622 and
-    // 0.666. Keeping them inside the SAME gap avoids re-spacing retail's rows, which is where
-    // the layout traps live. The spacing was set by LOOKING at it: the first attempt (0.632 /
-    // 0.686) put SCORES 0.034 from CONFIRM -- visibly crowding it, where every other row on
-    // this screen sits ~0.05 apart. Change these only with a fresh capture in hand
-    // (port/tools/meat_ui_shot.ps1).
-    *(float*)(uintptr_t)(it + 0x44) = 0.622f;
+    // TWO rows share the gap between MARKERS (0.58) and CONFIRM (0.72). ⚠ THE OLD NUMBERS
+    // (0.622 / 0.666) WERE SET BY LOOKING AT IT, and they were wrong -- user-reported as the
+    // bottom of this screen being crammed together. Measured instead: the engine gives a line
+    // a quad of (y1-y0)/em * size = 34/30 * 0.04 = 0.04533 in normalised units, and the old
+    // spacing left gaps of 0.0420 and 0.0440 -- BOTH smaller than the quad, so the boxes
+    // genuinely overlapped before any language was chosen. Three even gaps across the 0.14
+    // span give 0.04667 each, which is the largest spacing available without re-positioning
+    // retail's own rows (and 0.0013 of clearance is all there is: 3 x 0.04533 = 0.136 of
+    // 0.14). Arabic makes it look worse but does not cause it -- the cell height is identical
+    // to retail's; the ink just sits lower in the box. If this ever needs more room, the row
+    // SCALE is the lever, not these numbers.
+    *(float*)(uintptr_t)(it + 0x44) = 0.6267f;
     *U8(it + 0x48) = 1;                                     // visible
     *U8(it + 0x49) = 1;                                     // selectable
     *U8(it + 0x4B) = 0;                                     // not greyed out
@@ -179,11 +199,32 @@ static void BuildRow(uint32_t self) {
     SetAlign(hr, 0, 1);
     SetScale(hr, 0, 0x3D23D70A);                            // 0.04f, the screen's row scale
     *(float*)(uintptr_t)(hr + 0x40) = 0.5f;
-    *(float*)(uintptr_t)(hr + 0x44) = 0.666f;
+    *(float*)(uintptr_t)(hr + 0x44) = 0.6733f;   // the second of the three even gaps
     *U8(hr + 0x48) = 1;                                     // visible
     *U8(hr + 0x49) = 1;                                     // selectable
     *U8(hr + 0x4B) = 0;                                     // not greyed out
     ShowHide();
+
+    // EIGHT ROWS ON A SCREEN RETAIL SIZED FOR SIX. Re-space all of them evenly over the
+    // range the screen already uses (0.30 .. CONFIRM 0.72) rather than cramming ours into
+    // retail's single spare slot: 7 gaps of 0.06 instead of 0.0467, against a glyph quad of
+    // 0.04533. Each retail row is only moved if it is still sitting exactly where retail put
+    // it, so a changed build is left alone rather than scribbled on.
+    {
+        // 0.28 .. 0.76 rather than retail's 0.30 .. 0.72: the screen has empty space above
+        // the first row and below CONFIRM, and using it gives 0.0686 per row -- effectively
+        // retail's own 0.07 pitch for all EIGHT rows, instead of 0.06 for eight or 0.0467
+        // for the two that used to share one slot.
+        const float top = 0.28f, step = 0.48f / 7.0f;
+        for (int i = 0; i < 5; ++i) {
+            float* y = (float*)(uintptr_t)(self + kRetailRows[i] + 0x44);
+            if (*y > kRetailY[i] - 0.001f && *y < kRetailY[i] + 0.001f) *y = top + step * i;
+        }
+        *(float*)(uintptr_t)(it + 0x44) = top + step * 5;      // MAX MEAT -> 0.60
+        *(float*)(uintptr_t)(hr + 0x44) = top + step * 6;      // SCORES   -> 0.66
+        float* cy = (float*)(uintptr_t)(self + kRowConfirm + 0x44);
+        if (*cy > 0.719f && *cy < 0.721f) *cy = top + step * 7;   // CONFIRM -> 0.76
+    }
 
     // Splice BOTH into the d-pad ring between Markers and Confirm, in visual order.
     // AppendItem would put them after CONFIRM, which reads as "past the OK button". The
@@ -237,7 +278,7 @@ static uint32_t __fastcall Hk_Update(uint32_t self, uint32_t edx) {
             if (InputTest(in, 0, 4, pad)) d = 1;             // RIGHT
             else if (InputTest(in, 0, 3, pad)) d = -1;       // LEFT
         }
-        if (d) { g_hideSel = (g_hideSel + d + H_COUNT) % H_COUNT; ShowHide(); }
+        if (d) { g_hideSel = (g_hideSel + d + H_COUNT) % H_COUNT; ShowHide(); UiSfx(5); }
     }
     if (mine && in) {
         // Retail's Update only edits items it recognises by pointer, so it ignored ours --
@@ -253,6 +294,7 @@ static uint32_t __fastcall Hk_Update(uint32_t self, uint32_t edx) {
                 g_sel = (g_sel + d + V_COUNT) % V_COUNT;
             } while (g_sel == V_UNLIM && !TimeLimited());    // skip it with no clock
             ShowValue();
+            UiSfx(5);
         }
     }
     if (r != 6) return r;                                    // still on the screen

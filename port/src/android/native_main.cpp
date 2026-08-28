@@ -311,6 +311,67 @@ bool UnpackGameData(android_app* app, const char* ext) {
     return true;
 }
 
+// TOP UP an existing extraction. The full unpack is all-or-nothing and only runs when the
+// tree is absent, so a NEW file added to game.pak by a later build -- arabic_font.bin was the
+// first -- would never reach a phone that already had the game. The package manager replaces
+// the .so on upgrade, so the code moved and the data did not, and the new build looked
+// identical to the old one.
+//
+// game.pak is a STORED asset, so seeking is free: every entry that already matches is skipped
+// without reading it, and an upgrade writes only what actually changed.
+bool TopUpGameData(android_app* app, const char* ext) {
+    AAssetManager* am = app->activity->assetManager;
+    AAsset* pak = AAssetManager_open(am, "game.pak", AASSET_MODE_RANDOM);
+    if (!pak) return true;                       // dev flow (adb push): nothing to top up
+    char magic[4]; uint32_t ver = 0, count = 0;
+    if (AAsset_read(pak, magic, 4) != 4 || memcmp(magic, "TJPK", 4) != 0 ||
+        AAsset_read(pak, &ver, 4) != 4 || ver != 1 ||
+        AAsset_read(pak, &count, 4) != 4 || count == 0 || count > 100000) {
+        AAsset_close(pak); return true;          // not ours to judge here; the full path logs
+    }
+    struct Ent { std::string path; uint64_t size; uint64_t off; };
+    std::vector<Ent> ents;
+    ents.reserve(count);
+    uint64_t running = 0;
+    for (uint32_t i = 0; i < count; ++i) {
+        uint16_t len = 0; uint64_t sz = 0;
+        if (AAsset_read(pak, &len, 2) != 2 || len == 0 || len > 512) { AAsset_close(pak); return true; }
+        std::string path(len, 0);
+        if (AAsset_read(pak, &path[0], len) != (int)len) { AAsset_close(pak); return true; }
+        if (AAsset_read(pak, &sz, 8) != 8) { AAsset_close(pak); return true; }
+        if (path.find("..") != std::string::npos || path[0] == '/') { AAsset_close(pak); return true; }
+        Ent e; e.path = path; e.size = sz; e.off = running; running += sz;
+        ents.push_back(e);
+    }
+    const off64_t dataBase = AAsset_seek64(pak, 0, SEEK_CUR);   // index consumed: data starts here
+    const std::string dest = std::string(ext) + "/extracted";
+    std::vector<uint8_t> buf(1u << 20);
+    int wrote = 0;
+    for (const Ent& e : ents) {
+        const std::string out = dest + "/" + e.path;
+        struct stat st {};
+        if (stat(out.c_str(), &st) == 0 && (uint64_t)st.st_size == e.size) continue;  // current
+        if (AAsset_seek64(pak, dataBase + (off64_t)e.off, SEEK_SET) < 0) break;
+        if (!MakeDirsFor(out)) { LOGE("top-up mkdir failed for %s", out.c_str()); continue; }
+        int fd = open(out.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0660);
+        if (fd < 0) { LOGE("top-up create failed for %s (errno %d)", out.c_str(), errno); continue; }
+        uint64_t left = e.size; bool ok = true;
+        while (left) {
+            int want = (int)(left < buf.size() ? left : buf.size());
+            int got = AAsset_read(pak, buf.data(), (size_t)want);
+            if (got != want || !WriteAll(fd, buf.data(), (size_t)got)) { ok = false; break; }
+            left -= (uint64_t)got;
+        }
+        close(fd);
+        if (!ok) { LOGE("top-up short write for %s", e.path.c_str()); unlink(out.c_str()); continue; }
+        LOGI("topped up %s (%llu bytes)", e.path.c_str(), (unsigned long long)e.size);
+        ++wrote;
+    }
+    AAsset_close(pak);
+    if (wrote) LOGI("game data topped up: %d file(s) added or replaced", wrote);
+    return true;
+}
+
 // default.xbe present == the data is there. Cheap, and it is the file the game is handed.
 bool GameDataPresent(const char* ext) {
     std::string xbe = std::string(ext) + "/extracted/default.xbe";
@@ -375,7 +436,9 @@ bool SpawnGame(android_app* app) {
 
     // Self-contained APK: unpack the player's own game files on first launch. A dev build
     // whose files were pushed by adb already has them, and skips straight through.
-    if (!GameDataPresent(ext ? ext : ".") && !UnpackGameData(app, ext ? ext : "."))
+    // Present? top it up (an upgrade may add files). Absent? full unpack.
+    if (GameDataPresent(ext ? ext : ".")) TopUpGameData(app, ext ? ext : ".");
+    else if (!UnpackGameData(app, ext ? ext : "."))
         LOGE("game data could not be unpacked — the game will fail to find default.xbe");
 
     LOGI("spawning game: %s %s (game res %dx%d)", bin, xbe, g_gameW, g_gameH);

@@ -12,6 +12,7 @@
 #include "hybrid/dsound_stubs.h"
 #include "hybrid/net_lan.h"
 #include "hybrid/lan_ui.h"
+#include "hybrid/arabic.h"
 #include "runtime/gfx/d3d8.h"
 #include "runtime/assets/xmf_texture.h"
 #include "android/perf_hint.h"
@@ -609,6 +610,46 @@ static bool DecodeScratch(int fmt, const uint8_t* pix, size_t avail, const uint3
 }
 
 // Resolve (decode + upload, cached) the bound resource to a D3D11 texture handle.
+static const bool g_arabicProbe = [] {
+    char v[8] = { 0 };
+    return GetEnvironmentVariableA("TJ_ARABIC_PROBE", v, sizeof v) && v[0] == '1';
+}();
+// The 512x512 replacement glyph sheet, created once per resource that carries the retail
+// one. arabic.cpp owns the pixels (retail art decoded out of the guest's own texture by
+// this same decoder, Arabic strip below it); the handle is cached here beside the device.
+// A replacement controller glyph, cached beside the device like the sheet.
+static tj::gfx::TextureHandle ArabicSpriteTex(uint32_t resVA, int idx) {
+    static uint32_t cRes[8] = { 0 };
+    static tj::gfx::TextureHandle cTex[8];
+    static int cN = 0;
+    for (int i = 0; i < cN; ++i) if (cRes[i] == resVA) return cTex[i];
+    int w = 0, h = 0;
+    const uint32_t* px = ArabicSpritePixels(idx, &w, &h);
+    if (!px) return tj::gfx::kNoTexture;
+    tj::gfx::TextureHandle t = g_dev.CreateTexture(px, w, h);
+    if (t >= 0 && cN < 8) { cRes[cN] = resVA; cTex[cN] = t; ++cN; }
+    g_lastTexW = w; g_lastTexH = h;
+    return t;
+}
+static tj::gfx::TextureHandle ArabicSubstitute(uint32_t resVA) {
+    // ⚠ SAME CAP AS arabic.cpp's slot table. When this was 4 and that was 16, a fifth sheet
+    // address missed here on every bind and re-created a 512x1024 texture plus its mip chain
+    // each time, with nothing reclaiming them.
+    static uint32_t cRes[kArabicAtlasSlots] = { 0 };
+    static tj::gfx::TextureHandle cTex[kArabicAtlasSlots];
+    static int cN = 0;
+    static int cW = 0, cH = 0;
+    for (int i = 0; i < cN; ++i)
+        if (cRes[i] == resVA) { g_lastTexW = cW; g_lastTexH = cH; return cTex[i]; }
+    int aw = 0, ah = 0;
+    const uint32_t* px = ArabicAtlasPixels(resVA, &aw, &ah);
+    if (!px) return tj::gfx::kNoTexture;
+    tj::gfx::TextureHandle t = g_dev.CreateTexture(px, aw, ah);
+    if (t >= 0 && cN < kArabicAtlasSlots) { cRes[cN] = resVA; cTex[cN] = t; ++cN; }
+    cW = aw; cH = ah;
+    g_lastTexW = aw; g_lastTexH = ah;
+    return t;
+}
 static tj::gfx::TextureHandle ResolveTexture(void* res) {
     PhaseTimer _pt(&g_tTex);
     g_lastTexLinear = false; g_lastTexW = g_lastTexH = 1;
@@ -617,6 +658,33 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
     // texture that was rendered into -- their pool "pixels" are never CPU-written.
     if (RtTexEnt* rt = RtFind(res)) return rt->h;
     uint32_t resVA = (uint32_t)(uintptr_t)res;
+    // ARABIC: the glyph sheet is replaced wholesale by a larger one (arabic.cpp), because
+    // the retail 256x256 has no free space left. Intercepted here rather than decoded,
+    // since the resource's own format dword has been retold it is 512x512 -- which is what
+    // makes the engine divide glyph rectangles by the new width.
+    if (g_arabicProbe) {                 // TJ_ARABIC_PROBE=1: what resources actually arrive
+        static uint32_t seen[64]; static int seenN = 0;
+        bool dup = false;
+        for (int i = 0; i < seenN; ++i) if (seen[i] == resVA) dup = true;
+        if (!dup && seenN < 64) {
+            seen[seenN++] = resVA;
+            uint32_t f = *(uint32_t*)((char*)res + 0x0C);
+            uint32_t dp = *(uint32_t*)((char*)res + 0x04);
+            printf("[ar-probe] res=%08X data=%08X first=%08X fmtd=%08X %dx%d fmt=%02X\n",
+                   resVA, dp, (dp >= 0x1000 && dp < 0x10000000) ? *(uint32_t*)(uintptr_t)dp : 0,
+                   f, 1 << ((f >> 20) & 0xF), 1 << ((f >> 24) & 0xF), (f >> 8) & 0xFF);
+        }
+    }
+    if (ArabicIsFontAtlas(resVA)) {
+        ArabicReassertSheet(resVA);   // a FONT.PS2 reload restores the retail 256x256 dword,
+                                      // and this early-out is what would make that permanent
+        tj::gfx::TextureHandle t = ArabicSubstitute(resVA);
+        if (t >= 0) return t;
+    }
+    if (int sp = ArabicSpriteFor(resVA); sp >= 0) {
+        tj::gfx::TextureHandle t = ArabicSpriteTex(resVA, sp);
+        if (t >= 0) return t;
+    }
     const bool tempTex = resVA >= kTempTexBase && resVA < kTempTexEnd;
     if (tempTex && *(volatile uint8_t*)(uintptr_t)0x184661 == 7)   // in-match: smear strips
         return TransparentTex();
@@ -694,6 +762,21 @@ static tj::gfx::TextureHandle ResolveTexture(void* res) {
             ++g_frmTexSkip;
             return g_texCache[existSlot].h;
         }
+    }
+    // ARABIC: the glyph sheet is recognised by its own bytes -- the file is loaded once per
+    // resource container, so this catches every copy, and it cannot pick the neighbouring
+    // FONG sheet the way a pointer walk can. Registering retells the resource its size,
+    // which is what the engine divides glyph rectangles by from the next frame on.
+    if (ArabicMatchSheet(fmt, w, h, pix, srcBytes)) {
+        ArabicRegisterSheet(resVA);
+        tj::gfx::TextureHandle t = ArabicSubstitute(resVA);
+        if (t >= 0) return t;
+    }
+    // The controller face buttons, same identify-by-content rule (arabic.cpp).
+    if (int sp = -1; ArabicMatchSprite(fmt, w, h, pix, srcBytes, &sp)) {
+        ArabicRegisterSprite(resVA, sp);
+        tj::gfx::TextureHandle t = ArabicSpriteTex(resVA, sp);
+        if (t >= 0) return t;
     }
     const uint8_t* rawPix = pix;      // hash target: always the PRE-repack source bytes
     // Linear rows are 64-byte aligned; the decoder expects tight rows -> repack.

@@ -108,6 +108,7 @@ uint32_t GuestMarshalCall(uint32_t va, const uint32_t* stackW, int nStackW,
                           uint32_t ecx, uint32_t edx, int expectCleanBytes,
                           const char* what);
 float GuestMarshalPopF32();                        // pop ST0 (the caller's fstp)
+void  GuestMarshalPushF32(float v);                // push ST0 (a hook's float return)
 
 // ================= typed shim generation =================
 namespace dispatch_detail {
@@ -133,8 +134,12 @@ template <class T> inline T FromSlot(uint32_t raw) {
 // guest-visible address — checked at runtime on 64-bit hosts). Float/64-bit-integer
 // returns do not exist among the hooks today (audited session 26) — extend DELIBERATELY
 // if one appears: float returns must be pushed onto the guest x87 stack.
+// float is marshalable: it returns in ST0, which ShimCC pushes onto the guest x87 (and
+// which x86 gets for free from the dispatch bracket's fnsave). double and every 64-bit
+// return still are not -- those would need edx:eax or a second x87 slot decision.
 template <class R> struct RetOk : std::bool_constant<
-    std::is_pointer_v<R> || (sizeof(R) <= 4 && !std::is_floating_point_v<R>)> {};
+    std::is_pointer_v<R> || std::is_same_v<R, float> ||
+    (sizeof(R) <= 4 && !std::is_floating_point_v<R>)> {};
 template <> struct RetOk<void> : std::true_type {};
 
 #if defined(_M_IX86)
@@ -264,6 +269,8 @@ template <CallConv CC, class F> struct ShimCC {
                 uintptr_t v = (uintptr_t)r;
                 if (v >> 32) DispatchFatalRetPtr(e.label, e.key, (unsigned long long)v, ret);
                 s.r[tj::engine::EAX] = (uint32_t)v;
+            } else if constexpr (std::is_same_v<R, float>) {
+                GuestMarshalPushF32(r);      // x87 return convention: the value is ST0
             } else {
                 uint32_t u = 0; std::memcpy(&u, &r, sizeof(R));
                 s.r[tj::engine::EAX] = u;

@@ -61,6 +61,7 @@ portable.txt
 PROJECT_STATUS.md
 NEXT_SESSION.md
 NEXT_SESSION_ANDROID.md
+NEXT_SESSION_ARABIC.md
 port/MEAT_RUSH_PLAN.md
 port/LAN_PLAN.md
 port/ANDROID_PLAN.md
@@ -77,3 +78,6 @@ __pycache__/
 Thumbs.db
 desktop.ini
 port/build-apk/
+# The Arabic pack is a BUILD ARTIFACT and carries 64 signature bytes taken from the game's
+# own font sheet, so it is never pushed. Rebuild it with tools/arabic_font.py --pack.
+port/build-arabic/

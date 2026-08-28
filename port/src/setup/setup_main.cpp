@@ -273,9 +273,18 @@ static bool BuildAndroidVersion(InstallJob* job, const std::wstring& dest, std::
     const std::wstring dir = dest + L"\\Android";
     if (!MakeDirs(dir)) { why = L"the Android folder could not be created"; return false; }
 
-    // Exactly what the phone needs, and nothing else: the same four items the LAN data hash
-    // covers. tomjerry.ini, the runtime DLLs and _SAVES are PC-side and deliberately excluded.
-    static const wchar_t* kItems[] = { L"default.xbe", L"GFX", L"AUDMUSIC", L"AUDSoundFX" };
+    // Exactly what the phone needs, and nothing else: the four items the LAN data hash covers,
+    // plus the Arabic pack. tomjerry.ini, the runtime DLLs and _SAVES are PC-side and
+    // deliberately excluded.
+    //
+    // The pack sits at the ROOT of the packed tree because that is where arabic.cpp looks for
+    // it on Android: the executable there is libtjgame.so in the app's read-only native-lib
+    // dir, so the beside-the-exe lookup that serves the PC install cannot work and the asset
+    // root is used instead. It does NOT affect the LAN data hash, which covers default.xbe and
+    // the three asset trees only -- so a phone and a PC still match. An installer built with no
+    // pack simply skips it: the walk ignores names that do not exist.
+    static const wchar_t* kItems[] = { L"default.xbe", L"GFX", L"AUDMUSIC", L"AUDSoundFX",
+                                       L"arabic_font.bin" };
     const std::wstring apk = dir + L"\\Tom and Jerry - War of the Whiskers.apk";
     std::string err;
     if (!tj::setup::BuildAndroidApk(tpl, tplN, keyFile, dest,

@@ -27,6 +27,7 @@
 // can run on one PC; beacons are broadcast to that whole range (and to 127.0.0.1), which
 // is what makes two windows on one machine discover each other without any extra config.
 #include "net_lan.h"
+#include "hybrid/arabic.h"
 #include "hybrid/meat_rush.h"
 #include "hybrid/xdk_patch.h"   // PatchSetFingerprint (the sim-contract hash)
 #include "net_sync.h"
@@ -351,6 +352,14 @@ static void SanitizeName(char* dst, int cap, const char* src) {
     if (!dst[0]) strncpy_s(dst, cap, "PLAYER", _TRUNCATE);
 }
 
+// Arabic when the player has chosen it, the English literal otherwise. Only the lines a
+// player actually reads in normal play are translated; the Winsock/diagnostic ones stay
+// English on purpose -- they name error codes and exist to be searched for.
+static const char* L(uint16_t id, const char* en) {
+    if (ArabicEnabled())
+        if (const char* a = ArabicText(id)) return a;
+    return en;
+}
 static void Status(const char* fmt, ...) {
     va_list ap; va_start(ap, fmt);
     _vsnprintf_s(g_status, sizeof(g_status), _TRUNCATE, fmt, ap);
@@ -618,11 +627,13 @@ static void Broadcast(const void* p, int len) {
 // seats behind one address, and sending to both would duplicate every lobby update and every
 // input window at them -- harmless for correctness, but it doubles their traffic and makes the
 // packet counters lie.
-static void SendToPeers(const void* p, int len) {
+static void SendToPeersExcept(const void* p, int len, const sockaddr_in* except) {
     sockaddr_in sent[kSlots];
     int n = 0;
     for (int i = 0; i < kSlots; ++i) {
         if (!g_peers[i].active || IsLocalSlot(i)) continue;
+        if (except && g_peers[i].addr.sin_addr.s_addr == except->sin_addr.s_addr &&
+                      g_peers[i].addr.sin_port == except->sin_port) continue;
         bool dup = false;
         for (int k = 0; k < n && !dup; ++k)
             dup = sent[k].sin_addr.s_addr == g_peers[i].addr.sin_addr.s_addr &&
@@ -632,6 +643,7 @@ static void SendToPeers(const void* p, int len) {
         Send(p, len, g_peers[i].addr);
     }
 }
+static void SendToPeers(const void* p, int len) { SendToPeersExcept(p, len, nullptr); }
 
 // ---------------------------------------------------------------- input ring
 static void RingPut(int slot, uint32_t frame, const NetInput& in) {
@@ -992,7 +1004,7 @@ static void OnJoinReq(const PktJoinReq& q, const sockaddr_in& from, int len) {
     Send(&r, sizeof r, from);
     printf("[lan] %s joined as slot %d (mask %X, %d player(s)) (%s:%d)\n", g_peers[slot].name,
            slot, mask, localIdx, inet_ntoa(from.sin_addr), ntohs(from.sin_port));
-    Status("%s JOINED", g_peers[slot].name);
+    Status("%s %s", L(0x270, "JOINED"), g_peers[slot].name);
     SendLobbyState();
 }
 
@@ -1034,7 +1046,7 @@ static void OnJoinRsp(const PktJoinRsp& r, const sockaddr_in& from, int len) {
     g_peers[0].active = true; g_peers[0].addr = from; g_peers[0].lastRecv = Now();
     g_state = LAN_LOBBY;
     printf("[lan] joined session %08X as slot %d\n", r.sessionId, r.slot);
-    Status("JOINED - SLOT %d", r.slot + 1);
+    Status("%s %d", L(0x272, "JOINED - SLOT"), r.slot + 1);
 }
 
 static void OnLobby(const PktLobby& p, const sockaddr_in& from) {
@@ -1069,7 +1081,7 @@ static void OnIntent(const PktIntent& p) {
     case IN_LEAVE:
         g_peers[p.slot].active = false; g_slotKind[p.slot] = 0;
         s.ready = 0; s.name[0] = 0;
-        Status("%s LEFT", p.name);
+        Status("%s %s", L(0x271, "LEFT"), p.name);
         break;
     }
     PublishSlots();
@@ -1085,7 +1097,7 @@ static void OnStart(const PktStart& p) {
     if (g_state == LAN_MATCH && g_cfg.matchId == cfg.matchId) return;   // duplicate
     g_cfg = cfg; g_cfgCrc = crc; g_haveCfg = true;
     g_state = LAN_STARTING;
-    Status("STARTING MATCH...");
+    Status("%s", L(0x256, "STARTING MATCH..."));
 }
 
 static void OnReady(const PktReady& p) {
@@ -1096,7 +1108,7 @@ static void OnReady(const PktReady& p) {
         // real disagreement about what is being started rather than starting a doomed match.
         printf("[lan] slot %d reports config CRC %08X, ours is %08X -- ABORTING START\n",
                p.slot, p.crc, g_cfgCrc);
-        Status("CONFIG MISMATCH - START ABORTED");
+        Status("%s", L(0x27B, "CONFIG MISMATCH - START ABORTED"));
         g_state = LAN_LOBBY;
         return;
     }
@@ -1125,6 +1137,22 @@ static void OnInput(const PktInput& p, const sockaddr_in& from) {
     if (n) g_lastRemote = p.baseFrame + n - 1;
     g_peerNeed[p.slot] = p.need;
     if (p.slot < (uint32_t)kSlots) { g_peers[p.slot].lastRecv = Now(); g_peerInputSeen[p.slot] = true; }
+
+    // ⚠ THE HOST RELAYS. The session topology is a STAR: a joiner only ever learns the
+    // HOST's address (OnJoinRsp/OnLobby set g_peers[0] and nothing else), so joiner B and
+    // joiner C never exchange a single packet. With two machines that is invisible -- the
+    // one peer each side knows IS the other player. With three it deadlocks: the lockstep
+    // barrier in NetTickBegin needs an input for every human seat, B never receives C's, C
+    // never receives B's, and because a stalled peer stops producing new input the host
+    // starves too. Reproduced with three instances: all three sat at "stalled at frame 3,
+    // waiting for peer" forever, frame counter pinned at 0. Players reported it as a crash.
+    //
+    // Forwarding the datagram VERBATIM also fixes the catch-up window for free: the packet
+    // carries the sender's own `need`, so the store above gives every peer every other
+    // peer's rolling NACK, exactly as a direct mesh would. Sent to every machine except the
+    // one it came from, so nothing can loop.
+    if (g_isHost && !g_legacyMode && p.slot < (uint32_t)kSlots && !IsLocalSlot((int)p.slot))
+        SendToPeersExcept(&p, (int)sizeof p, &from);
 }
 
 static void PumpRecv() {
@@ -1190,17 +1218,17 @@ static void PumpRecv() {
                 if (g_isHost) { g_peers[b.slot].active = false; g_slotKind[b.slot] = 0;
                                 g_slots[b.slot].ready = 0; g_slots[b.slot].name[0] = 0;
                                 PublishSlots(); SendLobbyState(); }
-                else if (b.slot == 0) { Status("HOST LEFT THE GAME"); LanClose("host left"); }
+                else if (b.slot == 0) { Status("%s", L(0x273, "HOST LEFT THE GAME")); LanClose("host left"); }
                 else if (IsLocalSlot(b.slot)) {
                     // The host removed one of us. If it was this PC's only seat we are out of
                     // the game; if two people were sharing the machine, the other one plays on.
                     g_localMask &= (uint8_t)~(1u << b.slot);
                     g_localCount = 0;
                     for (int i = 0; i < kSlots; ++i) if (g_localMask & (1u << i)) ++g_localCount;
-                    if (!g_localCount) { Status("REMOVED BY THE HOST"); LanClose("kicked"); }
+                    if (!g_localCount) { Status("%s", L(0x274, "REMOVED BY THE HOST")); LanClose("kicked"); }
                     else {
                         g_localSlot = LocalSlotAt(0);
-                        Status("A PLAYER WAS REMOVED");
+                        Status("%s", L(0x275, "A PLAYER WAS REMOVED"));
                         printf("[lan] host removed our seat %d; %d left\n", b.slot, g_localCount);
                     }
                 }
@@ -1450,17 +1478,23 @@ const LanSlotInfo* LanSlot(int i) { return (i >= 0 && i < kSlots) ? &g_slots[i] 
 const char* LanStatusLine() { return g_status; }
 LanNak LanLastNak() { return g_lastNak; }
 const char* LanNakText() {
+    // Localized like the LAN screens they appear on: Arabic when the player has chosen it,
+    // the English literal otherwise (which is also what makes this switch readable).
+    auto L = [](uint16_t id, const char* en) {
+        if (ArabicEnabled()) if (const char* a = ArabicText(id)) return a;
+        return en;
+    };
     switch (g_lastNak) {
-    case NAK_FULL:     return "THAT GAME IS FULL";
+    case NAK_FULL:     return L(0x240, "THAT GAME IS FULL");
     // Reachable now only when the SIM CONTRACT differs — a real gameplay-affecting mismatch,
     // not merely a different binary, which cross-platform play makes routine.
-    case NAK_BUILD:    return "THAT PLAYER HAS A DIFFERENT GAME VERSION";
-    case NAK_DATA:     return "THAT PLAYER HAS DIFFERENT GAME FILES";
+    case NAK_BUILD:    return L(0x241, "THAT PLAYER HAS A DIFFERENT GAME VERSION");
+    case NAK_DATA:     return L(0x242, "THAT PLAYER HAS DIFFERENT GAME FILES");
     // The player sees this when the two PCs are on different releases. Say what to DO about it
     // -- "incompatible LAN protocol" is true and completely useless to somebody in a lobby.
-    case NAK_PROTO:    return "DIFFERENT VERSION - UPDATE BOTH PCS";
-    case NAK_INMATCH:  return "THAT GAME HAS ALREADY STARTED";
-    case NAK_PASSWORD: return "WRONG PASSWORD";
+    case NAK_PROTO:    return L(0x243, "DIFFERENT VERSION - UPDATE BOTH PCS");
+    case NAK_INMATCH:  return L(0x244, "THAT GAME HAS ALREADY STARTED");
+    case NAK_PASSWORD: return L(0x245, "WRONG PASSWORD");
     default:           return "";
     }
 }
@@ -1549,12 +1583,13 @@ bool LanOpen(bool host, const char* gameName, const char* password) {
         g_state = LAN_LOBBY;
         printf("[lan] HOSTING '%s' session=%08X on %d%s\n", g_gameName, g_sessionId, g_port,
                g_pwHash ? " (password)" : "");
-        Status("HOSTING ON PORT %d%s", g_port, g_pwHash ? " - LOCKED" : "");
+        Status("%s %d%s", L(0x254, "HOSTING ON PORT"), g_port,
+           g_pwHash ? (ArabicEnabled() ? " -" : " - LOCKED") : "");
     } else {
         g_isHost = false;
         LobbyReset(false);
         g_state = LAN_BROWSE;
-        Status("SEARCHING FOR GAMES...");
+        Status("%s", L(0x253, "SEARCHING FOR GAMES..."));
     }
     g_tBeacon = g_tPing = g_tProbe = 0;
     return true;
@@ -1601,7 +1636,7 @@ static bool JoinAddr(uint32_t ip, uint16_t port, uint32_t sessionId, const char*
     g_lastNak = NAK_NONE;
     g_tJoin = 0;
     SendJoinReq();
-    Status("JOINING...");
+    Status("%s", L(0x255, "JOINING..."));
     return true;
 }
 bool LanJoinGame(int i, const char* password) {
@@ -1613,14 +1648,14 @@ bool LanJoinGame(int i, const char* password) {
 // tedious and error-prone, and on a home LAN the other PC's name is usually what people know.
 // The grid is upper-case only, which is fine: DNS and NetBIOS name lookups are case-insensitive.
 bool LanJoinIp(const char* host, const char* password) {
-    if (!host || !*host) { Status("ENTER AN ADDRESS OR PC NAME"); return false; }
+    if (!host || !*host) { Status("%s", L(0x27C, "ENTER AN ADDRESS OR PC NAME")); return false; }
     in_addr a{};
     if (inet_pton(AF_INET, host, &a) != 1) {
         addrinfo hints{}; hints.ai_family = AF_INET; hints.ai_socktype = SOCK_DGRAM;
         addrinfo* res = nullptr;
         if (getaddrinfo(host, nullptr, &hints, &res) != 0 || !res) {
             printf("[lan] cannot resolve '%s'\n", host);
-            Status("CANNOT FIND %s", host);
+            Status("%s %s", L(0x27D, "CANNOT FIND"), host);
             return false;
         }
         a = ((sockaddr_in*)res->ai_addr)->sin_addr;
@@ -1649,7 +1684,7 @@ bool LanJoinIp(const char* host, const char* password) {
         Send(&pr, sizeof pr, to);
     }
     SendJoinReq();
-    Status("CONNECTING TO %s...", inet_ntoa(a));
+    Status("%s %s", L(0x27E, "CONNECTING TO"), inet_ntoa(a));
     return true;
 }
 
@@ -1795,7 +1830,7 @@ void LanHostKick(int slot) {
     g_slotKind[slot] = 0;
     g_slots[slot].ready = 0; g_slots[slot].name[0] = 0;
     printf("[lan] host removed slot %d (%s)\n", slot, who);
-    Status("%s WAS REMOVED", who[0] ? who : "A PLAYER");
+    Status("%s %s", L(0x276, "WAS REMOVED"), who[0] ? who : "");
     PublishSlots(); SendLobbyState();
 }
 
@@ -1810,8 +1845,12 @@ void LanHostToggleCpu(int slot) {
 // Mirrors the retail guard FUN_000243F0. The TWO-DISTINCT-TEAMS rule became mandatory the
 // moment the lobby let players pick a letter: with every seat on one letter the commit writes
 // FE+0x500 = 1, every AI target lookup returns 0 and the round can never end.
+// ALL FIVE ARE LOCALIZED, not just the common one. They share the lobby's single prompt
+// slot -- the most-read line on the screen -- so leaving any of them English flips that line
+// back to English at the exact moment the player needs to read it. (User-reported: "NEED AT
+// LEAST TWO PLAYERS" sitting under a fully Arabic lobby.)
 const char* LanStartRefusal() {
-    if (!g_isHost || g_state != LAN_LOBBY) return "NOT THE HOST";
+    if (!g_isHost || g_state != LAN_LOBBY) return L(0x260, "NOT THE HOST");
     int humans = 0, filled = 0;
     bool letter[4] = { false, false, false, false };
     for (int i = 0; i < kSlots; ++i) {
@@ -1820,13 +1859,14 @@ const char* LanStartRefusal() {
         letter[g_slots[i].team & 3] = true;
         if (g_slotKind[i] != 1) continue;
         ++humans;
-        if (!IsLocalSlot(i) && !g_slots[i].ready) return "WAITING FOR EVERYONE TO BE READY";
+        if (!IsLocalSlot(i) && !g_slots[i].ready)
+            return L(0x261, "WAITING FOR EVERYONE TO BE READY");
     }
-    if (humans < 1) return "NEED AT LEAST ONE HUMAN PLAYER";
-    if (filled < 2) return "NEED AT LEAST TWO PLAYERS";
+    if (humans < 1) return L(0x262, "NEED AT LEAST ONE HUMAN PLAYER");
+    if (filled < 2) return L(0x263, "NEED AT LEAST TWO PLAYERS");
     int teams = 0;
     for (int i = 0; i < 4; ++i) if (letter[i]) ++teams;
-    if (teams < 2) return "NEED AT LEAST TWO DIFFERENT TEAMS";
+    if (teams < 2) return L(0x264, "NEED AT LEAST TWO DIFFERENT TEAMS");
     return nullptr;
 }
 bool LanHostCanStart() { return LanStartRefusal() == nullptr; }
@@ -1839,7 +1879,7 @@ void LanHostStart() {
     for (int i = 0; i < kSlots; ++i) if (IsLocalSlot(i)) g_readySeen[i] = true;
     g_state = LAN_STARTING;
     g_tRetry = 0;
-    Status("STARTING MATCH...");
+    Status("%s", L(0x256, "STARTING MATCH..."));
     printf("[lan] START match %08X seed=%u arena=%d rounds=%d\n",
            g_cfg.matchId, g_cfg.seed, g_cfg.arena, g_cfg.rounds);
 }
@@ -1866,7 +1906,7 @@ void LanMatchEnded() {
         g_state = LAN_LOBBY;
         for (int i = 0; i < kSlots; ++i) g_slots[i].ready = 0;
         if (g_isHost) SendLobbyState();
-        Status("BACK IN THE LOBBY");
+        Status("%s", L(0x277, "BACK IN THE LOBBY"));
     }
 }
 
@@ -1915,7 +1955,7 @@ static void PollLocalPlayers() {
             --g_localCount;
         }
         g_localSlot = LocalSlotAt(0) < 0 ? g_localSlot : LocalSlotAt(0);
-        Status("A CONTROLLER WAS UNPLUGGED");
+        Status("%s", L(0x278, "A CONTROLLER WAS UNPLUGGED"));
         if (g_isHost) { PublishSlots(); SendLobbyState(); }
         return;
     }
@@ -1976,7 +2016,7 @@ void LanPump() {
     if (g_state == LAN_JOINING && now - g_tJoin >= 300) {
         g_tJoin = now;
         static int tries = 0;
-        if (++tries > 20) { tries = 0; g_state = LAN_BROWSE; Status("NO ANSWER FROM THAT GAME"); }
+        if (++tries > 20) { tries = 0; g_state = LAN_BROWSE; Status("%s", L(0x279, "NO ANSWER FROM THAT GAME")); }
         else SendJoinReq();
     }
     // PING/PONG -> RTT -> automatic input delay, frozen at GO.
@@ -2010,7 +2050,7 @@ void LanPump() {
                 printf("[lan] slot %d timed out\n", i);
                 g_peers[i].active = false; g_slotKind[i] = 0;
                 g_slots[i].ready = 0; g_slots[i].name[0] = 0;
-                Status("A PLAYER TIMED OUT");
+                Status("%s", L(0x27A, "A PLAYER TIMED OUT"));
                 PublishSlots(); SendLobbyState();
             }
     }
@@ -2031,10 +2071,27 @@ void LanPump() {
                 ArmLockstep(g_cfg);
             }
         } else if (g_haveCfg && LanFrontendCanLaunch()) {
-            PktReady r{}; Hdrs(r.h, P_READY); r.sessionId = g_sessionId;
-            r.matchId = g_cfg.matchId; r.crc = LanConfigCrc(&g_cfg);
-            r.slot = (uint8_t)g_localSlot;
-            Send(&r, sizeof r, g_peers[0].addr);
+            // ONE READY PER SEAT, NOT PER MACHINE. The host's GO gate demands g_readySeen[i]
+            // for EVERY non-local human seat, and OnJoinReq marks every granted seat kind 1 --
+            // but this used to send a single packet naming only g_localSlot, so the second
+            // seat of a two-pad joiner was never marked ready. `all` never became true, GO was
+            // never sent, and both machines sat in LAN_STARTING forever showing "STARTING
+            // MATCH...". That is THREE PLAYERS ON TWO MACHINES: a second, entirely separate
+            // hang from the 3-machine input deadlock, reachable from the normal UI because the
+            // lobby's own READY toggle writes a DIFFERENT flag (g_slots[i].ready), so the
+            // host's START button is enabled and the freeze lands after the player commits.
+            // Session 22 verified the mirror image (extra seats on the HOST, which
+            // LanHostStart pre-marks), so this direction was never exercised.
+            // PktReady is unchanged, so an old host simply sets the same bit twice: no
+            // kProtoVer bump.
+            for (int j = 0; j < g_localCount; ++j) {
+                int seat = LocalSlotAt(j);
+                if (seat < 0) continue;
+                PktReady r{}; Hdrs(r.h, P_READY); r.sessionId = g_sessionId;
+                r.matchId = g_cfg.matchId; r.crc = LanConfigCrc(&g_cfg);
+                r.slot = (uint8_t)seat;
+                Send(&r, sizeof r, g_peers[0].addr);
+            }
         }
     }
     // GO IS THE ONE PACKET NOBODY ANSWERS, AND IT WAS SENT EXACTLY ONCE. Four copies went out

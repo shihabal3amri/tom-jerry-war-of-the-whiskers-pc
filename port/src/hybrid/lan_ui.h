@@ -14,6 +14,11 @@ const char* LanCustomText(uint16_t idx);
 
 // Called from the main-menu Build/Update hooks in fe_menu.cpp.
 void     LanMenuBuild(uint32_t self);
+// The main-menu row's label is COMPOSED into lan_ui's own buffer, not looked up from the
+// string table: the item stores only the index and g_txt[] holds the bytes. The frontend
+// factory calls a screen's Build ONCE per frontend construction, never on a screen change,
+// so a language switch made on OPTIONS has to re-compose it explicitly.
+void     LanMenuRefreshText();
 uint32_t LanMenuUpdate(uint32_t self, uint32_t stockResult);
 
 // Once per presented frame, from FeMenuFrameTick.

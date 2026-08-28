@@ -114,6 +114,12 @@ set(HYB_GAME_SRC
     ${HYB}/meat_rush.cpp
     ${HYB}/meat_ui.cpp
     ${HYB}/meat_menu.cpp
+    # ⚠ WITHOUT THIS THE WHOLE ANDROID BUILD DOES NOT LINK. d3d8_bridge.cpp calls
+    # ArabicIsFontAtlas/ArabicAtlasPixels/ArabicRegisterSprite on its texture path, so the
+    # moment Arabic landed the arm64 target stopped linking -- and nobody saw it, because
+    # build_apk.ps1 preserves the installer's template across its own wipe and CMake happily
+    # kept embedding the last one that built. The template shipped five days stale.
+    ${HYB}/arabic.cpp
     ${HYB}/dsound_bridge.cpp
     ${HYB}/d3d8_bridge.cpp
     ${HYB}/prof.cpp

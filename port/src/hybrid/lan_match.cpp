@@ -94,6 +94,15 @@ const char* LanArenaName(int arena) {
 const char* LanCharName(int charId) {
     return (charId >= 0 && charId < 11) ? Text((uint16_t)(0x07 + charId)) : "?";
 }
+// TEAM A..D. The lobby used to draw the literal "TEAM %c", which stayed English in Arabic
+// AND could not be translated cheaply: the letter is A-D, and the Arabic font has no Latin
+// capitals -- it keeps only the retail characters Arabic strings actually reuse. Retail
+// already ships the whole phrase per letter for its own setup screen (0xAE..0xB1, "TEAM A"
+// / "الفريق أ"), so going through the string table is both correct in every language and
+// free: no new glyph, no new string, and the offline and LAN screens now read identically.
+const char* LanTeamName(int team) {
+    return Text((uint16_t)(0xAE + (team & 3)));
+}
 
 // --- settings-blob custody ---------------------------------------------------
 // A LAN session must never silently rewrite the player's single-player preferences or --

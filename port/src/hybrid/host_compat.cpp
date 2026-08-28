@@ -144,11 +144,29 @@ BOOL VirtualProtect(void* addr, size_t size, DWORD prot, DWORD* oldProt) {
     return TRUE;
 }
 
+// ⚠ THIS USED TO LIE, AND THE LIE WAS EXPENSIVE. It zeroed the struct and returned success,
+// so State came back 0 -- never MEM_COMMIT -- and every caller that asks "is this address
+// readable?" got NO for anything it could not answer another way. arabic.cpp's Readable()
+// fast-paths only the pool (0x04000000..0x10000000); on Android the master pointer, the font
+// set and every font live in the guest IMAGE window (0x00010000..0x0165E000), which is BELOW
+// that. So ClassifyFont never recognised a font, BuildArabicFont never ran, and the accent
+// overlay was never silenced -- Arabic on the phone drew with stray marks over the letters
+// while Windows was clean. Nothing logged, because every one of those functions returns
+// before its first printf.
+//
+// mincore is the honest answer and host_compat already relies on it in HostMapFixed: 0 means
+// the page is mapped, -1/ENOMEM means it is not. One syscall per page, and callers probe a
+// couple of pages at a time.
 SIZE_T VirtualQuery(const void* addr, MEMORY_BASIC_INFORMATION* mbi, size_t len) {
     if (!mbi || len < sizeof(*mbi)) return 0;
     memset(mbi, 0, sizeof(*mbi));
-    mbi->BaseAddress = const_cast<void*>(addr);
-    mbi->RegionSize = 0x1000;
+    uintptr_t page = (uintptr_t)addr & ~(uintptr_t)0xFFF;
+    unsigned char vec = 0;
+    bool mapped = mincore((void*)page, 0x1000, &vec) == 0;
+    mbi->BaseAddress = (void*)page;
+    mbi->RegionSize  = 0x1000;
+    mbi->State       = mapped ? MEM_COMMIT : MEM_FREE;
+    mbi->Protect     = mapped ? PAGE_READWRITE : PAGE_NOACCESS;
     return sizeof(*mbi);
 }
 
@@ -688,6 +706,17 @@ UINT GetPrivateProfileIntA(const char* section, const char* key, int def, const 
 
 BOOL WritePrivateProfileStringA(const char* section, const char* key, const char* value,
                                 const char* path) {
+    // WIN32 NULL SEMANTICS, which this shim did not implement and which crashed the phone:
+    //   section == NULL  -> "flush the cached copy of the ini". Windows callers use the
+    //                       triple-null call as a commit barrier; there is no cache here, so
+    //                       it is a no-op that must simply SUCCEED.
+    //   key     == NULL  -> delete the whole section.
+    //   value   == NULL  -> delete the key (already handled by the splice below).
+    // Without the first line, the parse loop reached strlen(section) on the ini's very first
+    // '[' line and dereferenced null. ArabicSave() makes exactly that call right after
+    // writing the language, so EVERY switch to Arabic killed the process on ARM -- while on
+    // Windows the same line is a documented no-op.
+    if (!section) return TRUE;
     char rp[1024];
     HostResolvePath(path, rp, sizeof(rp));
     // Read the whole file, splice the key.
@@ -724,10 +753,12 @@ BOOL WritePrivateProfileStringA(const char* section, const char* key, const char
             const char* e = strchr(t, ']');
             inSec = e && strlen(section) == (size_t)(e - t - 1) &&
                     strncasecmp(t + 1, section, (size_t)(e - t - 1)) == 0;
+            if (inSec && !key) { sawSec = true; continue; }   // key == NULL: drop the section
             if (inSec) sawSec = true;
             fputs(line, o);
             continue;
         }
+        if (inSec && !key) continue;                     // ...and everything inside it
         if (inSec) {
             const char* eq = strchr(t, '=');
             if (eq) {
@@ -742,7 +773,7 @@ BOOL WritePrivateProfileStringA(const char* section, const char* key, const char
         }
         fputs(line, o);
     }
-    if (!wroteKey && value) {
+    if (!wroteKey && value && key) {
         if (!sawSec) fprintf(o, "[%s]\n", section);
         else if (inSec) { /* section was last: fall through and append */ }
         fprintf(o, "%s=%s\n", key, value);

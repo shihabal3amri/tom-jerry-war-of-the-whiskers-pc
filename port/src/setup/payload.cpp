@@ -10,7 +10,7 @@ namespace tj::setup {
 
 namespace {
 
-struct Item { int id; const wchar_t* name; };
+struct Item { int id; const wchar_t* name; bool optional = false; };
 
 // The VC++ runtime is NOT part of Windows, so app-local copies are the supported way to avoid
 // making the player install a redist. The UCRT, d3d11, dxgi, ws2_32, xinput1_4 and xaudio2_9
@@ -27,6 +27,8 @@ const Item kItems[] = {
     { IDR_VCRUNTIME140_THR, L"vcruntime140_threads.dll" },
     { IDR_CONCRT140,        L"concrt140.dll" },
     { IDR_README,           L"README.txt" },
+    // Optional: absent when the installer was built without an Arabic pack.
+    { IDR_ARABIC_FONT,      L"arabic_font.bin", true },
 };
 
 bool FindRes(int id, const void*& data, DWORD& size) {
@@ -80,6 +82,7 @@ bool WritePayload(const wchar_t* destDir, int width, int height, int mode, std::
     for (const Item& it : kItems) {
         const void* d = nullptr; DWORD n = 0;
         if (!FindRes(it.id, d, n)) {
+            if (it.optional) continue;
             err = "The installer is damaged (a required file is missing from it). "
                   "Please download it again.";
             return false;

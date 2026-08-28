@@ -45,5 +45,6 @@ uint32_t LanFeMgr();
 uint32_t LanScreen(int id);
 const char* LanArenaName(int arena);
 const char* LanCharName(int charId);
+const char* LanTeamName(int team);      // "TEAM A" / "الفريق أ", from the retail table
 
 }  // namespace tj::hybrid

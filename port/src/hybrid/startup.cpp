@@ -23,6 +23,7 @@ int  InstallNetSync();        // net_sync.cpp (phase-2 LAN: determinism instrume
 int  InstallLanMatch();       // lan_match.cpp (launch parity, FIGHT SETTINGS, ROUNDS, names)
 int  InstallLanUi();          // lan_ui.cpp    (main-menu row, browser, lobby, text modal)
 int  InstallAudioUi();        // audio_ui.cpp  (two independent music/effects sliders)
+int  InstallArabic();         // arabic.cpp    (Arabic glyphs + strings; TJ_ARABIC=1)
 int  InstallMeatRush();       // meat_rush.cpp (MEAT RUSH: the meat is the only item)
 int  InstallMeatUi();         // meat_ui.cpp   (the MAX MEAT rule on FIGHT SETTINGS)
 int  InstallMeatMenu();       // meat_menu.cpp (MULTIPLAYER row + the submenu on screen 14)
@@ -311,6 +312,7 @@ bool RunGameLoop() {
     InstallLanUi();            // phase-2 LAN screens (must precede the menu row it labels)
     InstallFeMenu();           // options-menu VIDEO row + native RESOLUTION option
     InstallAudioUi();          // two independent audio sliders (frontend + pause badge)
+    InstallArabic();           // Arabic pack (glyph art + shaped strings); no-op unless asked
     InstallLanMatch();         // phase-2 LAN: launch parity, FIGHT SETTINGS, ROUNDS, names
     InstallMeatRush();         // MEAT RUSH: item scheduler steering (before the match)
     InstallMeatUi();           // MEAT RUSH: the MAX MEAT rule

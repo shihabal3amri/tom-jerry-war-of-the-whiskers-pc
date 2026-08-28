@@ -92,9 +92,12 @@ inline void* GetExceptionInformation() { return nullptr; }
 
 // ---- virtual memory ----------------------------------------------------------------
 #define MEM_COMMIT   0x1000u
+#define MEM_FREE     0x10000u  // VirtualQuery: nothing mapped at this address
 #define MEM_RESERVE  0x2000u
 #define MEM_RELEASE  0x8000u
 #define PAGE_NOACCESS          0x01u
+#define PAGE_GUARD             0x100u   // never set by the shim's VirtualQuery, but callers
+                                        // test for it (arabic.cpp's Readable) and must compile
 #define PAGE_READONLY          0x02u
 #define PAGE_READWRITE         0x04u
 #define PAGE_EXECUTE_READ      0x20u

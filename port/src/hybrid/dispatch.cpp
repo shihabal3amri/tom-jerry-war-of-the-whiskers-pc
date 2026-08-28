@@ -380,6 +380,40 @@ float GuestMarshalPopF32() {
 #endif
 }
 
+// The MIRROR of GuestMarshalPopF32: a hook that returns a float leaves it where the x87
+// return convention says -- ST0 -- for the guest caller to fstp.
+//
+// On x86 there is nothing to do. The shim calls the hook through a uint64-returning cast,
+// which never emits an fstp, so the value the callee left in ST0 is still there when
+// DispatchTryInvoke's fnsave captures the host FPU as the guest's x87 state. (The junk the
+// cast reads into eax:edx is written on purpose -- it is exactly what the escape path's
+// EmRetThunk captures, so the dispatch-vs-escape A/B still compares equal.)
+//
+// On ARM the guest x87 is an image, so this is an explicit fld: decrement TOP, slide the
+// ST-relative register area up one slot, and store the widened value with its tag.
+void GuestMarshalPushF32(float v) {
+#if defined(_M_IX86)
+    (void)v;
+#else
+    uint8_t* im = tj::engine::VirtualHostFpu()->image;
+    uint16_t sw = (uint16_t)(im[4] | (im[5] << 8));
+    uint16_t tw = (uint16_t)(im[8] | (im[9] << 8));
+    unsigned top = (sw >> 11) & 7;
+    top = (top + 7) & 7;                                  // fld decrements TOP
+    sw = (uint16_t)((sw & ~0x3800u) | (top << 11));
+    float32_t f;
+    std::memcpy(&f, &v, 4);
+    extFloat80_t e = f32_to_extF80(f);
+    tw = (uint16_t)(tw & ~(3u << (top * 2)));             // 00 = valid
+    if (v == 0.0f) tw = (uint16_t)(tw | (1u << (top * 2)));   // 01 = zero
+    std::memmove(im + 38, im + 28, 70);                   // ST0..ST6 -> ST1..ST7
+    std::memcpy(im + 28, &e.signif, 8);
+    std::memcpy(im + 36, &e.signExp, 2);
+    im[4] = (uint8_t)sw; im[5] = (uint8_t)(sw >> 8);
+    im[8] = (uint8_t)tw; im[9] = (uint8_t)(tw >> 8);
+#endif
+}
+
 bool DispatchTryInvoke(CpuState& s) {
     const DispatchEntry* e = Find(s.eip);
     if (!e) {

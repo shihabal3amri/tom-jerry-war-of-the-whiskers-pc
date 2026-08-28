@@ -166,7 +166,22 @@ const char* GuestInternStr(const char* s) {
     static int n = 0;
     for (int i = 0; i < n; ++i) if (src[i] == s) return dup[i];
     const char* d = GuestStrDup(s);
-    if (n < 256) { src[n] = s; dup[n] = d; ++n; }   // cache (full is never expected here)
+    if (n < 256) { src[n] = s; dup[n] = d; ++n; }
+    else {
+        // NOT "never expected" -- the Arabic pack has more strings than this cache has slots,
+        // and past the last slot every call re-duplicates into the guest arena on every draw
+        // until the below-4GB region is exhausted. That is a silent death; say it once, loudly,
+        // so the next provider that overflows this is found by reading a log instead of by
+        // bisecting a crash. (The fix is to make the provider's storage guest-visible.)
+        static bool warned = false;
+        if (!warned) {
+            warned = true;
+            printf("[patch] WARN: GuestInternStr cache FULL (256) -- every further string is\n"
+                   "        re-duplicated into the guest arena PER DRAW and will exhaust it.\n"
+                   "        Allocate that provider's strings below 4 GB instead.\n");
+            fflush(stdout);
+        }
+    }
     return d;
 #else
     return s;
