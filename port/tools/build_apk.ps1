@@ -124,6 +124,7 @@ if ($Install) {
     $adbExe = "$sdk\platform-tools\adb.exe"
     if ($Adb -ne "") { & $adbExe connect $Adb }
     & $adbExe install -r "$build\WOTW.apk"
+    $extDir = "/sdcard/Android/data/com.wotw.port/files"   # also needed by the -SkipAssets path below
     if (-not $SkipAssets) {
         # Push the game data to the app's external files dir. Stand-in for the SAF picker +
         # on-device extraction (still no disc data in the APK — this is the user's own copy).
@@ -176,7 +177,7 @@ if ($Install) {
     # libtjgame.so in the app's read-only native-lib dir, so arabic.cpp looks in the ASSET ROOT
     # instead. Pushed to the root of extracted/, which is LAN-safe -- dataHash covers
     # default.xbe plus GFX/AUDMUSIC/AUDSoundFX, so a peer without the pack still matches.
-    $pack = "$root\portuild-arabicrabic_font.bin"
+    $pack = "$root\port\build-arabic\arabic_font.bin"
     if (Test-Path $pack) {
         & $adbExe push $pack "$extDir/extracted/arabic_font.bin"
         Write-Host "== pushed arabic_font.bin ($([math]::Round((Get-Item $pack).Length/1KB)) KB) =="

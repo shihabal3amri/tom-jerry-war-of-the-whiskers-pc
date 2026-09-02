@@ -561,6 +561,64 @@ void GlesDrawShinyAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexC
     glActiveTexture(GL_TEXTURE0);   // leave unit 0 active for the single-texture paths
 }
 
+// --- touch-control overlay ----------------------------------------------------------------
+// Drawn by the compositor between the frame's replay and the swap, directly on the default
+// framebuffer in FULL SURFACE pixel coordinates (origin top-left) — the touch zones cover
+// the whole window including the pillarbox bars, so the game's 16:9 present rect is the
+// wrong space for it. The ring stream only carries state CHANGES, so whatever this touches
+// (viewport, blend, depth, the cached WVP) must be put back exactly, or the NEXT frame's
+// first draws inherit overlay state the game never asked for.
+void GlesDrawOverlay(const VertexPC* verts, int count) {
+    Device::Impl* p = (Device::Impl*)g_implV;
+    if (!p || !verts || count <= 0) return;
+    // A frame always ends on the backbuffer; if it somehow did not, skip the overlay for a
+    // frame rather than re-binding FBO 0 behind the device's render-target bookkeeping.
+    if (p->activeRT >= 0) return;
+    GLboolean blendOn = glIsEnabled(GL_BLEND);
+    GLboolean depthOn = glIsEnabled(GL_DEPTH_TEST);
+    GLboolean depthMask = GL_TRUE; glGetBooleanv(GL_DEPTH_WRITEMASK, &depthMask);
+    GLint bsr = GL_ONE, bdr = GL_ZERO, bsa = GL_ONE, bda = GL_ZERO;
+    glGetIntegerv(GL_BLEND_SRC_RGB, &bsr);   glGetIntegerv(GL_BLEND_DST_RGB, &bdr);
+    glGetIntegerv(GL_BLEND_SRC_ALPHA, &bsa); glGetIntegerv(GL_BLEND_DST_ALPHA, &bda);
+    float saveWvp[16]; memcpy(saveWvp, p->wvp, sizeof saveWvp);
+    int saveFlip = p->flip;
+
+    glBindFramebuffer(GL_FRAMEBUFFER, 0);        // always the window, never a game RT
+    glViewport(0, 0, p->w, p->h);
+    // Pixel-space ortho (row-major, shader does v*M): x -> [-1,1], y top-down -> [1,-1].
+    memset(p->wvp, 0, sizeof p->wvp);
+    p->wvp[0] = 2.0f / (float)p->w;  p->wvp[12] = -1.0f;
+    p->wvp[5] = -2.0f / (float)p->h; p->wvp[13] = 1.0f;
+    p->wvp[10] = 1.0f;               p->wvp[15] = 1.0f;
+    p->flip = 0;
+    glDisable(GL_DEPTH_TEST);
+    glEnable(GL_BLEND);
+    glBlendFuncSeparate(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA, GL_ONE, GL_ONE_MINUS_SRC_ALPHA);
+
+    glBindVertexArray(p->vao);
+    glBindBuffer(GL_ARRAY_BUFFER, p->vbo);
+    // Orphaning re-specification, same as every other upload here. The frame's own draws are
+    // already issued (the overlay runs after the OP_PRESENT that ends the frame), and the
+    // batched path re-uploads the whole stream next frame, so clobbering the buffer is safe.
+    glBufferData(GL_ARRAY_BUFFER, (GLsizeiptr)sizeof(VertexPC) * count, verts, GL_STREAM_DRAW);
+    p->ApplyWVP(p->color);
+    glEnableVertexAttribArray(0);
+    glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, sizeof(VertexPC), (void*)(uintptr_t)0);
+    glEnableVertexAttribArray(1);
+    glVertexAttribPointer(1, 4, GL_UNSIGNED_BYTE, GL_TRUE, sizeof(VertexPC), (void*)(uintptr_t)12);
+    glDisableVertexAttribArray(2);
+    glDisableVertexAttribArray(3);
+    glDrawArrays(GL_TRIANGLES, 0, count);
+
+    memcpy(p->wvp, saveWvp, sizeof saveWvp);
+    p->flip = saveFlip;
+    if (blendOn) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    glBlendFuncSeparate((GLenum)bsr, (GLenum)bdr, (GLenum)bsa, (GLenum)bda);
+    if (depthOn) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    glDepthMask(depthMask);
+    p->BackbufferViewport();
+}
+
 // --- the d3d8.h entry points: upload this draw, then run the same body -------------------
 void Device::DrawTriangleList(const VertexPC* verts, int vertexCount) {
     if (!p_ || vertexCount <= 0) return;

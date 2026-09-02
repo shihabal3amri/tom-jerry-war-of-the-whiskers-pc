@@ -132,6 +132,10 @@ private:
     friend void GlesDrawPTCAt(uint32_t, int, uint32_t, int);
     friend void GlesDrawShinyAt(uint32_t, int, uint32_t, int,
                                 TextureHandle, TextureHandle, TextureHandle, TextureHandle);
+    // Touch-control overlay: verts in SURFACE pixel coords (full window, pillars included —
+    // the touch zones live in surface space, not the game's 16:9 rect). Saves and restores
+    // every piece of GL state it touches, because the ring only sends state CHANGES.
+    friend void GlesDrawOverlay(const VertexPC*, int);
 };
 
 } // namespace tj::gfx

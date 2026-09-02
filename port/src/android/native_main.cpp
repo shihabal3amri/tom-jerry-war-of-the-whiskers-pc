@@ -12,10 +12,16 @@
 //      location that is exec-allowed on modern Android), handed the shared memfd + the
 //      asset path, reaped and killed with the activity.
 //
-// TOUCH LAYOUT (landscape, invisible zones for v1 — a drawn overlay comes later):
-//   left third          : movement — a virtual stick around the zone centre
-//   bottom-right corner : A (jump / confirm)      right edge, mid : B (grab / back)
-//   right, above A      : X (kick)                top-right corner: START
+// TOUCH CONTROLS (landscape). ON BY DEFAULT, and they DISAPPEAR — input and picture
+// together — the moment a physical controller is connected (InputDevice polled over JNI
+// once a second; the user's rule). TJ_TOUCH=0 in <external>/tj_flags.txt forces them off,
+// TJ_TOUCH=1 forces them on even with a pad. ONE layout table (TouchLayout) drives both
+// the hit-testing and the drawing, so what is drawn is exactly what responds:
+//   left   : virtual stick (ring + knob; any touch on the left 42% of the screen)
+//   right  : the Xbox diamond — Y top (kick), X left (punch), B right (grab), A bottom
+//            (jump); above it two pills, RT (block/guard) and RB (Black on the original Xbox, the
+//            taunt that fills the Berserk bar); ☰ (START/pause) small, top-right corner.
+// Player 1 only — one set of controls on one screen.
 #include <android_native_app_glue.h>
 #include <android/log.h>
 #include <android/input.h>
@@ -38,6 +44,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <cmath>
 #include <atomic>
 #include <new>
 #include <vector>
@@ -68,6 +75,9 @@ void GlesDrawPCAt(uint32_t vbOfs, int vertexCount);
 void GlesDrawPTCAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount);
 void GlesDrawShinyAt(uint32_t vbOfs, int vertexCount, uint32_t ibOfs, int indexCount,
                      TextureHandle t0, TextureHandle t1, TextureHandle t2, TextureHandle t3);
+// Touch-control overlay: VertexPC triangles in surface pixel coords, drawn on the default
+// framebuffer with its own state bracket (gles_gfx.cpp).
+void GlesDrawOverlay(const VertexPC* verts, int count);
 }
 
 namespace {
@@ -508,6 +518,47 @@ int SeatFor(int32_t dev, bool claim) {
     return -1;                                  // five controllers, four seats
 }
 int g_surfW = 0, g_surfH = 0;         // ACTUAL current surface dims (touch-zone space)
+// Touch controls (hit zones + drawn overlay). g_touchMode: 2 = AUTO (default: on until a
+// physical controller is present), 0 = never, 1 = always. g_padPresent is the JNI poll's
+// answer (render thread writes, glue thread reads). One switch gates BOTH input and picture
+// on purpose: controls that respond invisibly, or draw without responding, are each worse
+// than absent.
+int g_touchMode = 2;
+std::atomic<bool> g_padPresent{false};
+inline bool TouchActive() {
+    return g_touchMode == 1 || (g_touchMode == 2 && !g_padPresent.load(std::memory_order_relaxed));
+}
+
+// THE ONE LAYOUT TABLE. Everything is a fraction of the surface HEIGHT so the cluster is the
+// same physical size on any aspect ratio, anchored to the right edge for the right hand.
+struct TouchLayout {
+    float W = 0, H = 0;
+    float stickX = 0, stickY = 0, stickR = 0, knobR = 0, stickZoneX = 0;
+    struct Btn { float x, y, r; int slot; char ch; uint32_t rgb; };
+    Btn face[4];                                   // Y, X, B, A (analog slots 3, 2, 1, 0)
+    struct Pill { float x, y, w, h; int slot; const char* label; };
+    Pill pill[2];                                  // GUARD (RT, slot 7), RAGE (Black, slot 4)
+    float menuX = 0, menuY = 0, menuR = 0;         // START (buttons bit 0x10)
+};
+TouchLayout MakeLayout(int w, int h) {
+    TouchLayout L;
+    L.W = (float)w; L.H = (float)h;
+    const float H = L.H, W = L.W;
+    L.stickX = H * 0.36f; L.stickY = H * 0.66f; L.stickR = H * 0.20f; L.knobR = H * 0.085f;
+    L.stickZoneX = W * 0.42f;
+    const float dcx = W - H * 0.40f, dcy = H * 0.66f, d = H * 0.135f, r = H * 0.068f;
+    L.face[0] = { dcx,     dcy - d, r, 3, 'Y', 0xFFB900u };   // kick
+    L.face[1] = { dcx - d, dcy,     r, 2, 'X', 0x0078D7u };   // punch
+    L.face[2] = { dcx + d, dcy,     r, 1, 'B', 0xE81123u };   // grab
+    L.face[3] = { dcx,     dcy + d, r, 0, 'A', 0x107C10u };   // jump
+    // Labelled with the BUTTON names (user preference), in the modern Xbox naming the face
+    // glyphs already use: RT = block/guard, RB (the original Xbox's Black) = taunt/rage.
+    const float pw = H * 0.17f, ph = H * 0.085f, py = H * 0.30f;
+    L.pill[0] = { W - H * 0.225f, py, pw, ph, 7, "RT" };
+    L.pill[1] = { W - H * 0.435f, py, pw, ph, 4, "RB" };
+    L.menuX = W - H * 0.10f; L.menuY = H * 0.11f; L.menuR = H * 0.042f;
+    return L;
+}
 
 void PushPad() {
     if (!g_hdr) return;
@@ -538,25 +589,31 @@ void PushPad() {
     g_hdr->padSeq.fetch_add(1, std::memory_order_release);      // -> even: stable
 }
 
+// Hit-test one pointer against the layout. Face buttons: NEAREST centre within a generous
+// radius (fat hitboxes without ambiguity where they overlap). Pills: their rect grown 25%.
 void ClassifyTouch(float x, float y, Pad& t) {
     if (g_surfW <= 0 || g_surfH <= 0) return;
-    if (x < g_surfW / 3.0f) {
-        float cx = g_surfW / 6.0f, cy = g_surfH * 0.62f;
-        float span = g_surfH * 0.22f;
-        float nx = (x - cx) / span, ny = (y - cy) / span;
-        if (nx > 1) nx = 1; if (nx < -1) nx = -1;
-        if (ny > 1) ny = 1; if (ny < -1) ny = -1;
+    const TouchLayout L = MakeLayout(g_surfW, g_surfH);
+    if (x < L.stickZoneX) {
+        float nx = (x - L.stickX) / L.stickR, ny = (y - L.stickY) / L.stickR;
+        float len = sqrtf(nx * nx + ny * ny);
+        if (len > 1.0f) { nx /= len; ny /= len; }   // clamp to the ring, keep direction
         t.lx = (short)(nx * 32000);
-        t.ly = (short)(-ny * 32000);              // screen y is down; stick y is up
-    } else if (x > g_surfW * 0.66f) {
-        bool right = x > g_surfW * 0.83f;
-        bool bottom = y > g_surfH * 0.55f;
-        bool top = y < g_surfH * 0.25f;
-        if (top && right) t.buttons |= 0x10;            // START
-        else if (bottom && right) t.analog[0] = 255;    // A
-        else if (bottom && !right) t.analog[2] = 255;   // X
-        else t.analog[1] = 255;                         // B
+        t.ly = (short)(-ny * 32000);                 // screen y is down; stick y is up
+        return;
     }
+    if (hypotf(x - L.menuX, y - L.menuY) <= L.menuR * 1.5f) { t.buttons |= 0x10; return; }
+    for (const auto& p : L.pill) {
+        if (fabsf(x - p.x) <= p.w * 0.625f && fabsf(y - p.y) <= p.h * 0.75f) {
+            t.analog[p.slot] = 255; return;
+        }
+    }
+    int best = -1; float bestD = L.H * 0.105f;       // max reach: ~1.5 radii
+    for (int i = 0; i < 4; ++i) {
+        float dd = hypotf(x - L.face[i].x, y - L.face[i].y);
+        if (dd < bestD) { bestD = dd; best = i; }
+    }
+    if (best >= 0) t.analog[L.face[best].slot] = 255;
 }
 
 int32_t OnInput(android_app*, AInputEvent* e) {
@@ -673,6 +730,14 @@ int32_t OnInput(android_app*, AInputEvent* e) {
             return 1;
         }
         if (source & AINPUT_SOURCE_TOUCHSCREEN) {
+            // Hidden (controller present, or TJ_TOUCH=0): a touch does nothing — but it
+            // still CLEARS the touch pad, so a finger that was held when the pad appeared
+            // cannot leave a button stuck on.
+            if (!TouchActive()) {
+                g_touch = Pad{};
+                PushPad();
+                return 0;
+            }
             int32_t action = AMotionEvent_getAction(e);
             int32_t flags = action & AMOTION_EVENT_ACTION_MASK;
             int upIdx = -1;
@@ -1030,6 +1095,213 @@ int ReplayRing() {
     return ReplayRange(nullptr);
 }
 
+// ---- touch-control overlay geometry --------------------------------------------------------
+// Built fresh each presented frame (a few hundred verts — negligible next to the replay) so
+// the knob follows the finger and pressed buttons light up. Reads g_touch, which the glue
+// thread writes; that race is display-only and a frame late at worst, so it is left benign.
+// Positions MIRROR ClassifyTouch: the drawn circles sit inside their (larger) hit zones, so
+// aiming at the art always lands the input.
+std::vector<tj::gfx::VertexPC> g_ovl;
+
+void OvlTri(float x0, float y0, float x1, float y1, float x2, float y2, uint32_t c) {
+    g_ovl.push_back({ x0, y0, 0.5f, c });
+    g_ovl.push_back({ x1, y1, 0.5f, c });
+    g_ovl.push_back({ x2, y2, 0.5f, c });
+}
+void OvlCircle(float cx, float cy, float r, uint32_t c) {
+    const int N = 36;
+    for (int i = 0; i < N; ++i) {
+        float a0 = (float)i * 6.2831853f / N, a1 = (float)(i + 1) * 6.2831853f / N;
+        OvlTri(cx, cy, cx + cosf(a0) * r, cy + sinf(a0) * r,
+                       cx + cosf(a1) * r, cy + sinf(a1) * r, c);
+    }
+}
+void OvlRing(float cx, float cy, float r, float t, uint32_t c) {
+    const int N = 48;
+    for (int i = 0; i < N; ++i) {
+        float a0 = (float)i * 6.2831853f / N, a1 = (float)(i + 1) * 6.2831853f / N;
+        float c0 = cosf(a0), s0 = sinf(a0), c1 = cosf(a1), s1 = sinf(a1);
+        float ax = cx + c0 * (r - t), ay = cy + s0 * (r - t);
+        float bx = cx + c0 * r,       by = cy + s0 * r;
+        float dx = cx + c1 * (r - t), dy = cy + s1 * (r - t);
+        float ex = cx + c1 * r,       ey = cy + s1 * r;
+        OvlTri(ax, ay, bx, by, ex, ey, c);
+        OvlTri(ax, ay, ex, ey, dx, dy, c);
+    }
+}
+void OvlSeg(float x0, float y0, float x1, float y1, float t, uint32_t c) {
+    float dx = x1 - x0, dy = y1 - y0, len = sqrtf(dx * dx + dy * dy);
+    if (len < 1e-3f) return;
+    float nx = -dy / len * t * 0.5f, ny = dx / len * t * 0.5f;
+    OvlTri(x0 + nx, y0 + ny, x1 + nx, y1 + ny, x1 - nx, y1 - ny, c);
+    OvlTri(x0 + nx, y0 + ny, x1 - nx, y1 - ny, x0 - nx, y0 - ny, c);
+}
+// Stadium (pill): a centre rect with a half-disc at each end.
+void OvlStadium(float cx, float cy, float w, float h, uint32_t c) {
+    const float r = h * 0.5f, hw = w * 0.5f - r;
+    OvlTri(cx - hw, cy - r, cx + hw, cy - r, cx + hw, cy + r, c);
+    OvlTri(cx - hw, cy - r, cx + hw, cy + r, cx - hw, cy + r, c);
+    OvlCircle(cx - hw, cy, r, c);
+    OvlCircle(cx + hw, cy, r, c);
+}
+// Stroke letters in a unit box (x -0.35..0.35, y -0.5..0.5, y down), scaled by s around
+// (cx,cy). A squared, single-stroke face — no curves — so every glyph is a few quads. Only
+// the letters the overlay uses exist: the four face buttons and the words GUARD / RAGE.
+void OvlLetter(char ch, float cx, float cy, float s, float t, uint32_t c) {
+    auto seg = [&](float ax, float ay, float bx, float by) {
+        OvlSeg(cx + ax * s, cy + ay * s, cx + bx * s, cy + by * s, t, c);
+    };
+    switch (ch) {
+        case 'A':
+            seg(-0.38f, 0.50f, 0.0f, -0.50f); seg(0.0f, -0.50f, 0.38f, 0.50f);
+            seg(-0.21f, 0.15f, 0.21f, 0.15f);
+            break;
+        case 'B':
+            seg(-0.32f, -0.50f, -0.32f, 0.50f);
+            seg(-0.32f, -0.50f, 0.28f, -0.50f); seg(-0.32f, 0.0f, 0.28f, 0.0f);
+            seg(-0.32f, 0.50f, 0.28f, 0.50f);
+            seg(0.28f, -0.50f, 0.28f, 0.0f);    seg(0.28f, 0.0f, 0.28f, 0.50f);
+            break;
+        case 'D':
+            seg(-0.32f, -0.50f, -0.32f, 0.50f);
+            seg(-0.32f, -0.50f, 0.12f, -0.50f); seg(0.12f, -0.50f, 0.32f, -0.30f);
+            seg(0.32f, -0.30f, 0.32f, 0.30f);   seg(0.32f, 0.30f, 0.12f, 0.50f);
+            seg(0.12f, 0.50f, -0.32f, 0.50f);
+            break;
+        case 'E':
+            seg(-0.32f, -0.50f, -0.32f, 0.50f);
+            seg(-0.32f, -0.50f, 0.30f, -0.50f); seg(-0.32f, 0.0f, 0.22f, 0.0f);
+            seg(-0.32f, 0.50f, 0.30f, 0.50f);
+            break;
+        case 'G':
+            seg(0.32f, -0.50f, -0.32f, -0.50f); seg(-0.32f, -0.50f, -0.32f, 0.50f);
+            seg(-0.32f, 0.50f, 0.32f, 0.50f);   seg(0.32f, 0.50f, 0.32f, 0.02f);
+            seg(0.32f, 0.02f, 0.0f, 0.02f);
+            break;
+        case 'R':
+            seg(-0.32f, -0.50f, -0.32f, 0.50f);
+            seg(-0.32f, -0.50f, 0.28f, -0.50f); seg(0.28f, -0.50f, 0.28f, 0.0f);
+            seg(0.28f, 0.0f, -0.32f, 0.0f);     seg(-0.04f, 0.0f, 0.32f, 0.50f);
+            break;
+        case 'T':
+            seg(-0.35f, -0.50f, 0.35f, -0.50f); seg(0.0f, -0.50f, 0.0f, 0.50f);
+            break;
+        case 'U':
+            seg(-0.32f, -0.50f, -0.32f, 0.50f); seg(-0.32f, 0.50f, 0.32f, 0.50f);
+            seg(0.32f, 0.50f, 0.32f, -0.50f);
+            break;
+        case 'X':
+            seg(-0.35f, -0.50f, 0.35f, 0.50f); seg(0.35f, -0.50f, -0.35f, 0.50f);
+            break;
+        case 'Y':
+            seg(-0.35f, -0.50f, 0.0f, -0.05f); seg(0.35f, -0.50f, 0.0f, -0.05f);
+            seg(0.0f, -0.05f, 0.0f, 0.50f);
+            break;
+        default: break;
+    }
+}
+void OvlText(const char* s, float cx, float cy, float size, float t, uint32_t c) {
+    const float adv = size * 0.86f;
+    int n = (int)strlen(s);
+    float x = cx - adv * (float)(n - 1) * 0.5f;
+    for (int i = 0; i < n; ++i, x += adv) OvlLetter(s[i], x, cy, size, t, c);
+}
+
+int BuildTouchOverlay() {
+    g_ovl.clear();
+    if (g_surfW <= 0 || g_surfH <= 0) return 0;
+    const TouchLayout L = MakeLayout(g_surfW, g_surfH);
+    const float H = L.H;
+    const Pad t = g_touch;                     // snapshot; see the race note above
+    const float rim = H * 0.006f, stroke = H * 0.013f;
+
+    // Virtual stick: ring + knob following the finger.
+    OvlRing(L.stickX, L.stickY, L.stickR, H * 0.008f, 0x50FFFFFFu);
+    const bool stickHeld = (t.lx != 0 || t.ly != 0);
+    const float kx = L.stickX + (float)t.lx / 32000.0f * (L.stickR - L.knobR);
+    const float ky = L.stickY - (float)t.ly / 32000.0f * (L.stickR - L.knobR);
+    OvlCircle(kx, ky, L.knobR, stickHeld ? 0x90FFFFFFu : 0x58FFFFFFu);
+
+    // The diamond: modern flat style (coloured disc, thin rim, white letter) — the same
+    // language the in-game button glyphs were redrawn in.
+    for (const auto& b : L.face) {
+        const bool down = t.analog[b.slot] != 0;
+        OvlCircle(b.x, b.y, b.r, ((down ? 0xB8u : 0x48u) << 24) | b.rgb);
+        OvlRing(b.x, b.y, b.r, rim, ((down ? 0xE0u : 0x90u) << 24) | b.rgb);
+        OvlLetter(b.ch, b.x, b.y, b.r * 1.05f, stroke, down ? 0xF0FFFFFFu : 0xB0FFFFFFu);
+    }
+
+    // GUARD / RAGE pills: dark stadium with a light rim (a slightly larger one behind).
+    for (const auto& p : L.pill) {
+        const bool down = t.analog[p.slot] != 0;
+        OvlStadium(p.x, p.y, p.w + rim * 2, p.h + rim * 2, ((down ? 0xE0u : 0x80u) << 24) | 0xC0C0C0u);
+        OvlStadium(p.x, p.y, p.w, p.h, ((down ? 0xC0u : 0x60u) << 24) | 0x202020u);
+        OvlText(p.label, p.x, p.y, p.h * 0.52f, stroke * 0.7f, down ? 0xF0FFFFFFu : 0xC0FFFFFFu);
+    }
+
+    // START: the Xbox menu glyph (☰) on a small dark disc, tucked in the corner.
+    const bool sDown = (t.buttons & 0x10) != 0;
+    OvlCircle(L.menuX, L.menuY, L.menuR, ((sDown ? 0xB8u : 0x40u) << 24) | 0x303030u);
+    OvlRing(L.menuX, L.menuY, L.menuR, rim, ((sDown ? 0xE0u : 0x80u) << 24) | 0xA0A0A0u);
+    const uint32_t lineCol = sDown ? 0xF0FFFFFFu : 0xB0FFFFFFu;
+    for (int i = -1; i <= 1; ++i) {
+        const float y = L.menuY + (float)i * L.menuR * 0.36f;
+        OvlSeg(L.menuX - L.menuR * 0.45f, y, L.menuX + L.menuR * 0.45f, y, L.menuR * 0.14f, lineCol);
+    }
+    return (int)g_ovl.size();
+}
+
+// ---- physical-controller presence (JNI, polled from the render thread) --------------------
+// InputDevice.getDeviceIds() + getSources(): a non-virtual device advertising GAMEPAD or
+// JOYSTICK sources is a controller. Polled once a second — connection and disconnection
+// both fire no native event, so polling is the whole mechanism. FindClass from a native
+// thread resolves framework classes through the system loader, which is all we need.
+bool QueryPadPresent(JNIEnv* env) {
+    jclass cls = env->FindClass("android/view/InputDevice");
+    if (!cls) { env->ExceptionClear(); return false; }
+    jmethodID mIds  = env->GetStaticMethodID(cls, "getDeviceIds", "()[I");
+    jmethodID mDev  = env->GetStaticMethodID(cls, "getDevice", "(I)Landroid/view/InputDevice;");
+    jmethodID mSrc  = env->GetMethodID(cls, "getSources", "()I");
+    jmethodID mVirt = env->GetMethodID(cls, "isVirtual", "()Z");
+    bool present = false;
+    static bool diagOnce = false;                // one line naming what the poll sees
+    if (mIds && mDev && mSrc && mVirt) {
+        jintArray ids = (jintArray)env->CallStaticObjectMethod(cls, mIds);
+        if (ids) {
+            jsize n = env->GetArrayLength(ids);
+            jint* v = env->GetIntArrayElements(ids, nullptr);
+            for (jsize i = 0; i < n && !present; ++i) {
+                jobject dev = env->CallStaticObjectMethod(cls, mDev, v[i]);
+                if (!dev) continue;
+                const jint src = env->CallIntMethod(dev, mSrc);
+                const jboolean virt = env->CallBooleanMethod(dev, mVirt);
+                const bool gamepad  = (src & 0x00000401) == 0x00000401;   // SOURCE_GAMEPAD
+                const bool joystick = (src & 0x01000010) == 0x01000010;   // SOURCE_JOYSTICK
+                if (!diagOnce)
+                    LOGI("pad poll: device %d sources=0x%08x virtual=%d", (int)v[i], (unsigned)src, (int)virt);
+                if (!virt && (gamepad || joystick)) present = true;
+                env->DeleteLocalRef(dev);
+            }
+            if (!diagOnce) LOGI("pad poll: %d device(s), controller present=%d", (int)n, (int)present);
+            env->ReleaseIntArrayElements(ids, v, JNI_ABORT);
+            env->DeleteLocalRef(ids);
+        } else if (!diagOnce) LOGI("pad poll: getDeviceIds returned null");
+    } else if (!diagOnce) LOGE("pad poll: InputDevice method lookup failed");
+    diagOnce = true;
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); present = false; }
+    env->DeleteLocalRef(cls);
+    return present;
+}
+void PollPadPresent(JNIEnv* env) {
+    const bool now = QueryPadPresent(env);
+    if (now != g_padPresent.load(std::memory_order_relaxed)) {
+        g_padPresent.store(now, std::memory_order_relaxed);
+        if (g_touchMode == 2)
+            LOGI("touch controls %s (controller %s)", now ? "HIDDEN" : "SHOWN",
+                 now ? "connected" : "disconnected");
+    }
+}
+
 void* RenderThread(void* pv) {
     ANativeWindow* win = (ANativeWindow*)pv;
     for (int i = 0; i < 4096; ++i) g_texMap[i] = -1;
@@ -1071,6 +1343,12 @@ void* RenderThread(void* pv) {
     uint64_t rN = 0, rReplay = 0, rSwap = 0, rBatch = 0;
     uint64_t rCpuReplay = 0, rCpuSwap = 0;
     uint64_t rPart = 0, rPartCpu = 0, rPartN = 0;
+    // JNI for the controller-presence poll. Attached for the thread's whole life; a failed
+    // attach just means AUTO behaves as "no controller" (overlay stays up).
+    JNIEnv* jniEnv = nullptr;
+    JavaVM* jvm = g_activity ? g_activity->vm : nullptr;
+    if (jvm && jvm->AttachCurrentThread(&jniEnv, nullptr) != JNI_OK) jniEnv = nullptr;
+    if (jniEnv && g_touchMode == 2) PollPadPresent(jniEnv);   // first frame: right answer
     while (!g_stop.load(std::memory_order_relaxed)) {
         if (g_surfaceLost.load(std::memory_order_acquire)) {
             if (haveSurface) { tj::gfx::GlesReleaseWindowSurface(); haveSurface = false; }
@@ -1108,6 +1386,11 @@ void* RenderThread(void* pv) {
         int frames = ReplayRing();
         uint64_t t1 = NowNs(), c1 = NowCpuNs();
         if (frames > 0) {
+            if (g_touchMode == 2 && jniEnv && (rN % 60) == 0) PollPadPresent(jniEnv);
+            if (TouchActive()) {
+                int n = BuildTouchOverlay();
+                if (n) tj::gfx::GlesDrawOverlay(g_ovl.data(), n);
+            }
             g_dev.Present();                             // ONE swap per drained batch
             uint64_t t2 = NowNs(), c2 = NowCpuNs();
             rReplay += t1 - t0; rSwap += t2 - t1; rBatch += (uint64_t)frames;
@@ -1245,6 +1528,8 @@ void android_main(android_app* app) {
                 if (const char* dg = strstr(line, "TJ_COMP_DIAG="))
                     g_compDiag = (uint32_t)strtoul(dg + 13, nullptr, 0);
                 if (strstr(line, "TJ_COMP_BATCH=0")) g_batch = false;
+                if (strstr(line, "TJ_TOUCH=0")) { g_touchMode = 0; LOGI("touch controls OFF (TJ_TOUCH=0)"); }
+                if (strstr(line, "TJ_TOUCH=1")) { g_touchMode = 1; LOGI("touch controls ALWAYS ON (TJ_TOUCH=1)"); }
                 if (const char* sc = strstr(line, "TJ_GAME_SCALE=")) {
                     float v = (float)atof(sc + 14);
                     if (v >= 0.35f && v <= 1.0f) g_gameScale = v;
